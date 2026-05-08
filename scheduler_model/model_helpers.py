@@ -408,74 +408,136 @@ def add_order_line_position_stability_constraints(
     num_orders,
     horizon,
     x,
+    y,
+    l,
     available_lines,
+    line_available=None,
+    target_order_indices=None,
+    name_prefix="order_line_extra_drift",
 ):
     """
-    添加订单产线位置稳定性软约束变量。
-
-    该函数建议只在停电模式下使用。
+    添加订单跨日产线额外漂移惩罚变量。
 
     业务含义：
-    同一个订单在相邻非全厂停电日之间，尽量继续使用同一批产线，
-    避免出现订单前几天在上方产线块生产，后一天突然移动到下方产线块的情况。
+    允许订单正常加线、减线；
+    只惩罚扣除正常加减线后的额外产线漂移。
 
-    注意：
-    这是软约束，不会强制禁止换位置。
-    如果因为停电、交期或产能限制必须换线，模型仍然允许换，
-    但会在目标函数中受到惩罚。
+    示例：
+    昨天：Line 8、9、10
+    今天：Line 8、9、10、11
+    这是正常加线，不惩罚。
 
-    数学含义：
-    order_line_position_change[i,j,idx] 近似表示：
+    昨天：Line 8、9、10
+    今天：Line 9、10、11
+    这是整体漂移，惩罚。
 
-        |x[i,j,t1] - x[i,j,t2]|
-
-    其中：
-    - t1 和 t2 是相邻两个非全厂停电日；
-    - x[i,j,t] = 1 表示第 i 条产线第 t 天生产订单 j。
-
-    如果订单 j 在产线 i 上：
-    - t1 有生产，t2 没生产，算一次变化；
-    - t1 没生产，t2 有生产，也算一次变化；
-    - 两天都生产或两天都不生产，不算变化。
+    停电模式下：
+    1. 自动跳过全厂停电日；
+    2. 如果某条产线在前后任意一天不可用，则不比较这条线。
     """
-
-    # 只比较非全厂停电日，避免全厂停电造成的中断被误判为位置变化
     work_days = get_factory_work_days(
         horizon,
         available_lines,
     )
 
-    order_line_position_change = {}
+    if target_order_indices is None:
+        target_order_indices = list(range(num_orders))
 
-    for i in range(NUM_LINES):
-        for j in range(num_orders):
-            for idx in range(len(work_days) - 1):
-                t1 = work_days[idx]
-                t2 = work_days[idx + 1]
+    extra_position_change = {}
+
+    for j in target_order_indices:
+        for idx in range(len(work_days) - 1):
+            t1 = work_days[idx]
+            t2 = work_days[idx + 1]
+
+            both_active = model.NewBoolVar(
+                f"{name_prefix}_both_active_order{j}_day{t1}_{t2}"
+            )
+
+            model.Add(both_active <= y[j, t1])
+            model.Add(both_active <= y[j, t2])
+            model.Add(both_active >= y[j, t1] + y[j, t2] - 1)
+
+            change_vars = []
+
+            for i in range(NUM_LINES):
+                if line_available is not None:
+                    if line_available[i][t1] == 0 or line_available[i][t2] == 0:
+                        continue
 
                 change = model.NewBoolVar(
-                    f"order{j}_line{i}_position_change_workidx{idx}"
+                    f"{name_prefix}_order{j}_line{i}_day{t1}_{t2}"
                 )
 
-                order_line_position_change[i, j, idx] = change
+                change_vars.append(change)
 
-                # change >= x[i,j,t1] - x[i,j,t2]
-                # change >= x[i,j,t2] - x[i,j,t1]
-                #
-                # 在目标函数最小化 change 时，
-                # change 会等于 |x[i,j,t1] - x[i,j,t2]|
                 model.Add(
                     change >= x[i, j, t1] - x[i, j, t2]
-                )
+                ).OnlyEnforceIf(both_active)
+
                 model.Add(
                     change >= x[i, j, t2] - x[i, j, t1]
-                )
+                ).OnlyEnforceIf(both_active)
 
-    total_order_line_position_change = sum(
-        order_line_position_change.values()
-    )
+                model.Add(
+                    change <= x[i, j, t1] + x[i, j, t2]
+                ).OnlyEnforceIf(both_active)
 
-    return order_line_position_change, total_order_line_position_change
+                model.Add(
+                    change <= 2 - x[i, j, t1] - x[i, j, t2]
+                ).OnlyEnforceIf(both_active)
+
+                model.Add(change == 0).OnlyEnforceIf(both_active.Not())
+
+            total_position_change = model.NewIntVar(
+                0,
+                NUM_LINES,
+                f"{name_prefix}_total_change_order{j}_day{t1}_{t2}"
+            )
+
+            if change_vars:
+                model.Add(total_position_change == sum(change_vars))
+            else:
+                model.Add(total_position_change == 0)
+
+            line_count_delta = model.NewIntVar(
+                -NUM_LINES,
+                NUM_LINES,
+                f"{name_prefix}_line_count_delta_order{j}_day{t1}_{t2}"
+            )
+
+            line_count_diff = model.NewIntVar(
+                0,
+                NUM_LINES,
+                f"{name_prefix}_line_count_diff_order{j}_day{t1}_{t2}"
+            )
+
+            model.Add(line_count_delta == l[j, t2] - l[j, t1])
+            model.AddAbsEquality(line_count_diff, line_count_delta)
+
+            extra_change = model.NewIntVar(
+                0,
+                NUM_LINES,
+                f"{name_prefix}_extra_change_order{j}_day{t1}_{t2}"
+            )
+
+            # 额外漂移 = 总产线变化 - 正常加减线变化
+            model.Add(
+                extra_change >= total_position_change - line_count_diff
+            ).OnlyEnforceIf(both_active)
+
+            model.Add(extra_change == 0).OnlyEnforceIf(both_active.Not())
+
+            extra_position_change[j, t1, t2] = extra_change
+
+    if extra_position_change:
+        total_extra_position_change = sum(
+            extra_position_change.values()
+        )
+    else:
+        total_extra_position_change = 0
+
+    return extra_position_change, total_extra_position_change
 
 
 def add_order_start_end_linking_constraints(

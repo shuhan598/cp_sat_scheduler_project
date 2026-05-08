@@ -11,7 +11,7 @@ MIN_LINES_PER_ACTIVE_ORDER = 3         # 订单当天生产时最少占用产线
 # 求解器参数
 # =========================
 
-MAX_SOLVE_TIME_SECONDS = 300           # 单次求解时间上限，单位：秒
+MAX_SOLVE_TIME_SECONDS = 300          # 单次求解时间上限，单位：秒
 NUM_SEARCH_WORKERS = 8                 # CP-SAT 并行搜索线程数
 
 
@@ -25,7 +25,7 @@ WEIGHT_LINE_STABILITY = 120            # 订单每日占线数波动惩罚
 WEIGHT_LOAD_SPREAD = 5                 # 每日总开线数波动惩罚
 WEIGHT_OVER_PRODUCTION = 700           # 超产惩罚
 WEIGHT_PROD_DAYS = 5                   # 生产日数量惩罚
-WEIGHT_ORDER_LINE_POSITION = 80        # 订单跨日产线位置变化惩罚
+WEIGHT_ORDER_LINE_POSITION = 500       # 订单跨日额外产线漂移惩罚
 
 
 # =========================

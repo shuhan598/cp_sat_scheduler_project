@@ -121,21 +121,22 @@ def build_objective(
         total_over_output_units = None
 
         objective_expr = (
-            WEIGHT_CHANGEOVER * total_changeovers
-            + WEIGHT_ACTIVE_DAYS * sum(e[j] - s[j] + 1 for j in range(num_orders))
-            + WEIGHT_LINE_STABILITY * total_line_diff
-            + WEIGHT_LOAD_SPREAD * load_spread
-            + WEIGHT_OVER_PRODUCTION * total_over_line_days
-            + 5 * sum(prod_day[t] for t in range(horizon))
-            + weighted_plan_change_penalty
-            + WEIGHT_QUANTITY_INCREASE_CONTINUE * total_quantity_continue_break
-            + WEIGHT_DELAYED_ORDER_COUNT * total_delayed_orders
-            + WEIGHT_WEIGHTED_TARDINESS * total_weighted_tardiness
-            + WEIGHT_ORDER_SPLIT * total_order_split
-            + WEIGHT_LINE_ORDER_SPLIT * total_line_order_split
-            + WEIGHT_IDLE_LINE_INSERT * total_idle_lines
-            + WEIGHT_INSERT_LINE_STABILITY * total_insert_line_stability
-            + WEIGHT_INSERT_PROD_DAYS * total_insert_prod_days
+                WEIGHT_CHANGEOVER * total_changeovers
+                + WEIGHT_ACTIVE_DAYS * sum(e[j] - s[j] + 1 for j in range(num_orders))
+                + WEIGHT_LINE_STABILITY * total_line_diff
+                + WEIGHT_ORDER_LINE_POSITION * total_order_line_position_change
+                + WEIGHT_LOAD_SPREAD * load_spread
+                + WEIGHT_OVER_PRODUCTION * total_over_line_days
+                + WEIGHT_PROD_DAYS * sum(prod_day[t] for t in range(horizon))
+                + weighted_plan_change_penalty
+                + WEIGHT_QUANTITY_INCREASE_CONTINUE * total_quantity_continue_break
+                + WEIGHT_DELAYED_ORDER_COUNT * total_delayed_orders
+                + WEIGHT_WEIGHTED_TARDINESS * total_weighted_tardiness
+                + WEIGHT_ORDER_SPLIT * total_order_split
+                + WEIGHT_LINE_ORDER_SPLIT * total_line_order_split
+                + WEIGHT_IDLE_LINE_INSERT * total_idle_lines
+                + WEIGHT_INSERT_LINE_STABILITY * total_insert_line_stability
+                + WEIGHT_INSERT_PROD_DAYS * total_insert_prod_days
         )
     else:
         total_changeovers = sum(w.values())
