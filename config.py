@@ -25,7 +25,8 @@ WEIGHT_LINE_STABILITY = 120            # 订单每日占线数波动惩罚
 WEIGHT_LOAD_SPREAD = 5                 # 每日总开线数波动惩罚
 WEIGHT_OVER_PRODUCTION = 700           # 超产惩罚
 WEIGHT_PROD_DAYS = 5                   # 生产日数量惩罚
-WEIGHT_ORDER_LINE_POSITION = 500       # 订单跨日额外产线漂移惩罚
+WEIGHT_ORDER_LINE_POSITION = 1200      # 订单跨日额外产线漂移惩罚
+WEIGHT_OUTAGE_RESUME_LINE_POSITION = 2500  # 停电前后恢复原产线额外惩罚
 
 
 # =========================

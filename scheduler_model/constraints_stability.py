@@ -3,13 +3,14 @@
 # 这个文件负责产线位置稳定性相关软约束。
 #
 # 主要职责：
-# 1. 普通排产：减少订单跨日额外产线漂移；
-# 2. 停电排产：跳过全厂停电日，尽量恢复停电前产线组合；
-# 3. 插单排产：优先约束新插单订单 / 加量订单的产线漂移。
+# 1. 所有模式下的通用订单产线号稳定；
+# 2. 停电模式下的停电前后恢复原产线加强；
+# 3. 插单模式下新插单 / 加量订单的额外稳定性加强。
 # =========================
 
 from scheduler_model.model_helpers import (
     add_order_line_position_stability_constraints,
+    add_outage_resume_line_position_constraints,
 )
 
 
@@ -31,31 +32,49 @@ def add_position_stability_constraints(
     """
     添加产线位置稳定性软约束。
 
-    普通排产：
-        所有订单启用额外漂移惩罚。
+    第一层：通用产线号稳定
+        所有模式、所有订单都启用。
+        用于保证订单生产期间尽量保持产线号稳定。
 
-    停电排产：
-        所有订单启用额外漂移惩罚；
-        比较时跳过全厂停电日；
-        单条产线停电时，不强制比较不可用产线。
+    第二层：停电前后恢复原产线
+        只在停电模式启用。
+        用于加强停电前最后生产日和停电后恢复生产日之间的产线恢复。
 
-    插单排产：
-        新插单订单、同名新批次订单、加量订单启用额外漂移惩罚；
-        原订单主要依靠旧计划扰动惩罚控制，不在这里额外强压。
+    第三层：插单订单 / 加量订单额外稳定
+        只在插单模式启用。
+        对插单新单、同名新批次、加量订单再额外加强稳定。
     """
 
-    order_line_position_change = {}
-    total_order_line_position_change = 0
+    # =========================
+    # 1. 通用产线号稳定：三种模式都启用
+    # =========================
+    (
+        order_line_position_change,
+        total_order_line_position_change,
+    ) = add_order_line_position_stability_constraints(
+        model=model,
+        num_orders=num_orders,
+        horizon=horizon,
+        x=x,
+        y=y,
+        l=l,
+        available_lines=available_lines,
+        line_available=line_available,
+        target_order_indices=None,
+        name_prefix="general_extra_drift",
+    )
 
-    insert_line_stability_change = {}
-    total_insert_line_stability = 0
+    # =========================
+    # 2. 停电前后恢复原产线：仅停电模式启用
+    # =========================
+    outage_resume_line_position_change = {}
+    total_outage_resume_line_position_change = 0
 
-    # 普通排产 / 普通停电排产：所有订单启用
-    if not enable_insert_mode:
+    if has_power_outage:
         (
-            order_line_position_change,
-            total_order_line_position_change,
-        ) = add_order_line_position_stability_constraints(
+            outage_resume_line_position_change,
+            total_outage_resume_line_position_change,
+        ) = add_outage_resume_line_position_constraints(
             model=model,
             num_orders=num_orders,
             horizon=horizon,
@@ -65,11 +84,16 @@ def add_position_stability_constraints(
             available_lines=available_lines,
             line_available=line_available,
             target_order_indices=None,
-            name_prefix="normal_extra_drift",
+            name_prefix="outage_resume_extra_drift",
         )
 
-    # 插单排产：先只对新插单订单 / 加量订单启用
-    else:
+    # =========================
+    # 3. 插单模式：新插单 / 加量订单额外稳定
+    # =========================
+    insert_line_stability_change = {}
+    total_insert_line_stability = 0
+
+    if enable_insert_mode:
         target_order_names = (
             set(inserted_order_names or [])
             | set(quantity_increased_order_names or [])
@@ -100,6 +124,8 @@ def add_position_stability_constraints(
     return (
         order_line_position_change,
         total_order_line_position_change,
+        outage_resume_line_position_change,
+        total_outage_resume_line_position_change,
         insert_line_stability_change,
         total_insert_line_stability,
     )

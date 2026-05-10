@@ -312,6 +312,87 @@ def add_active_line_block_constraints(
         )
 
 
+def add_available_active_line_block_constraints(
+    model,
+    horizon,
+    u,
+    prod_day,
+    active_block_start,
+    active_block_end,
+    line_available,
+):
+    """
+    添加停电模式下的开线产线整体连续约束。
+
+    与 add_active_line_block_constraints 的区别：
+    1. 只在当天可用产线序列中判断连续；
+    2. 停电产线不参与连续性判断；
+    3. 如果 active_block_start / active_block_end 中没有对应变量，
+       会在这里自动创建，避免停电模式下 KeyError。
+    """
+
+    for t in range(horizon):
+        lines_today = [
+            i for i in range(NUM_LINES)
+            if line_available[i][t] == 1
+        ]
+
+        if not lines_today:
+            model.Add(prod_day[t] == 0)
+            continue
+
+        # 停电模式下，active_block_start / active_block_end
+        # 可能没有提前创建，所以这里按需创建。
+        for i in lines_today:
+            if (i, t) not in active_block_start:
+                active_block_start[i, t] = model.NewBoolVar(
+                    f"available_active_block_start_line{i}_day{t}"
+                )
+
+            if (i, t) not in active_block_end:
+                active_block_end[i, t] = model.NewBoolVar(
+                    f"available_active_block_end_line{i}_day{t}"
+                )
+
+        for idx, i in enumerate(lines_today):
+            if idx == 0:
+                model.Add(active_block_start[i, t] == u[i, t])
+            else:
+                prev_i = lines_today[idx - 1]
+
+                model.Add(
+                    active_block_start[i, t] >= u[i, t] - u[prev_i, t]
+                )
+                model.Add(
+                    active_block_start[i, t] <= u[i, t]
+                )
+                model.Add(
+                    active_block_start[i, t] <= 1 - u[prev_i, t]
+                )
+
+            if idx == len(lines_today) - 1:
+                model.Add(active_block_end[i, t] == u[i, t])
+            else:
+                next_i = lines_today[idx + 1]
+
+                model.Add(
+                    active_block_end[i, t] >= u[i, t] - u[next_i, t]
+                )
+                model.Add(
+                    active_block_end[i, t] <= u[i, t]
+                )
+                model.Add(
+                    active_block_end[i, t] <= 1 - u[next_i, t]
+                )
+
+        model.Add(
+            sum(active_block_start[i, t] for i in lines_today) == prod_day[t]
+        )
+        model.Add(
+            sum(active_block_end[i, t] for i in lines_today) == prod_day[t]
+        )
+
+
 def add_order_window_constraints(
     model,
     orders,
@@ -403,70 +484,136 @@ def add_at_most_one_active_segment(
     return start_flags
 
 
-def add_order_line_position_stability_constraints(
-    model,
-    num_orders,
-    horizon,
-    x,
-    y,
-    l,
-    available_lines,
-    line_available=None,
-    target_order_indices=None,
-    name_prefix="order_line_extra_drift",
-):
+def _build_adjacent_work_day_pairs(horizon, available_lines):
     """
-    添加订单跨日产线额外漂移惩罚变量。
+    构造相邻可生产日对。
 
-    业务含义：
-    允许订单正常加线、减线；
-    只惩罚扣除正常加减线后的额外产线漂移。
+    普通模式：
+        等价于相邻自然日期。
 
-    示例：
-    昨天：Line 8、9、10
-    今天：Line 8、9、10、11
-    这是正常加线，不惩罚。
+    停电模式：
+        自动跳过全厂停电日。
+        例如：
+            3/10 可生产
+            3/11 全厂停电
+            3/12 全厂停电
+            3/13 可生产
 
-    昨天：Line 8、9、10
-    今天：Line 9、10、11
-    这是整体漂移，惩罚。
-
-    停电模式下：
-    1. 自动跳过全厂停电日；
-    2. 如果某条产线在前后任意一天不可用，则不比较这条线。
+        会生成：
+            (3/10, 3/13)
     """
     work_days = get_factory_work_days(
         horizon,
         available_lines,
     )
 
+    return [
+        (work_days[idx], work_days[idx + 1])
+        for idx in range(len(work_days) - 1)
+    ]
+
+
+def _build_outage_resume_day_pairs(horizon, available_lines):
+    """
+    构造全厂停电前后恢复生产的日期对。
+
+    只针对全厂停电区间：
+    1. 找到停电前最后一个可生产日；
+    2. 找到停电后第一个可生产日；
+    3. 对这两个日期额外加强产线恢复惩罚。
+    """
+    outage_pairs = []
+
+    t = 0
+
+    while t < horizon:
+        if available_lines[t] > 0:
+            t += 1
+            continue
+
+        outage_start = t
+
+        while t < horizon and available_lines[t] == 0:
+            t += 1
+
+        outage_end = t - 1
+
+        pre_day = outage_start - 1
+        while pre_day >= 0 and available_lines[pre_day] == 0:
+            pre_day -= 1
+
+        post_day = outage_end + 1
+        while post_day < horizon and available_lines[post_day] == 0:
+            post_day += 1
+
+        if pre_day >= 0 and post_day < horizon:
+            outage_pairs.append((pre_day, post_day))
+
+    return outage_pairs
+
+
+def _add_extra_line_drift_for_day_pairs(
+    model,
+    num_orders,
+    x,
+    y,
+    l,
+    day_pairs,
+    line_available=None,
+    target_order_indices=None,
+    name_prefix="extra_line_drift",
+):
+    """
+    对指定日期对添加“额外产线漂移”惩罚变量。
+
+    核心逻辑：
+        额外漂移 = 产线组合变化量 - 正常加减线数量
+
+    正常加线：
+        Line 8,9,10 -> Line 8,9,10,11
+        不重点惩罚。
+
+    正常减线：
+        Line 8,9,10,11 -> Line 8,9,10
+        不重点惩罚。
+
+    整体漂移：
+        Line 8,9,10 -> Line 9,10,11
+        要惩罚。
+
+    停电模式下：
+        如果某条线在前后任意一天不可用，则不比较这条线，
+        避免把“产线不可用”误判为订单漂移。
+    """
     if target_order_indices is None:
         target_order_indices = list(range(num_orders))
 
     extra_position_change = {}
 
     for j in target_order_indices:
-        for idx in range(len(work_days) - 1):
-            t1 = work_days[idx]
-            t2 = work_days[idx + 1]
-
+        for pair_idx, (t1, t2) in enumerate(day_pairs):
             both_active = model.NewBoolVar(
-                f"{name_prefix}_both_active_order{j}_day{t1}_{t2}"
+                f"{name_prefix}_both_active_order{j}_pair{pair_idx}_day{t1}_{t2}"
             )
 
             model.Add(both_active <= y[j, t1])
             model.Add(both_active <= y[j, t2])
             model.Add(both_active >= y[j, t1] + y[j, t2] - 1)
 
-            change_vars = []
+            comparable_lines = []
 
             for i in range(NUM_LINES):
                 if line_available is not None:
                     if line_available[i][t1] == 0 or line_available[i][t2] == 0:
                         continue
 
+                comparable_lines.append(i)
+
+            change_vars = []
+
+            for i in comparable_lines:
                 change = model.NewBoolVar(
-                    f"{name_prefix}_order{j}_line{i}_day{t1}_{t2}"
+                    f"{name_prefix}_order{j}_line{i}_pair{pair_idx}_day{t1}_{t2}"
                 )
 
                 change_vars.append(change)
@@ -492,7 +639,7 @@ def add_order_line_position_stability_constraints(
             total_position_change = model.NewIntVar(
                 0,
                 NUM_LINES,
-                f"{name_prefix}_total_change_order{j}_day{t1}_{t2}"
+                f"{name_prefix}_total_position_change_order{j}_pair{pair_idx}_day{t1}_{t2}"
             )
 
             if change_vars:
@@ -503,25 +650,35 @@ def add_order_line_position_stability_constraints(
             line_count_delta = model.NewIntVar(
                 -NUM_LINES,
                 NUM_LINES,
-                f"{name_prefix}_line_count_delta_order{j}_day{t1}_{t2}"
+                f"{name_prefix}_line_count_delta_order{j}_pair{pair_idx}_day{t1}_{t2}"
             )
 
             line_count_diff = model.NewIntVar(
                 0,
                 NUM_LINES,
-                f"{name_prefix}_line_count_diff_order{j}_day{t1}_{t2}"
+                f"{name_prefix}_line_count_diff_order{j}_pair{pair_idx}_day{t1}_{t2}"
             )
 
-            model.Add(line_count_delta == l[j, t2] - l[j, t1])
-            model.AddAbsEquality(line_count_diff, line_count_delta)
+            if comparable_lines:
+                model.Add(
+                    line_count_delta ==
+                    sum(x[i, j, t2] for i in comparable_lines)
+                    - sum(x[i, j, t1] for i in comparable_lines)
+                )
+            else:
+                model.Add(line_count_delta == 0)
+
+            model.AddAbsEquality(
+                line_count_diff,
+                line_count_delta,
+            )
 
             extra_change = model.NewIntVar(
                 0,
                 NUM_LINES,
-                f"{name_prefix}_extra_change_order{j}_day{t1}_{t2}"
+                f"{name_prefix}_extra_change_order{j}_pair{pair_idx}_day{t1}_{t2}"
             )
 
-            # 额外漂移 = 总产线变化 - 正常加减线变化
             model.Add(
                 extra_change >= total_position_change - line_count_diff
             ).OnlyEnforceIf(both_active)
@@ -538,6 +695,98 @@ def add_order_line_position_stability_constraints(
         total_extra_position_change = 0
 
     return extra_position_change, total_extra_position_change
+
+
+def add_order_line_position_stability_constraints(
+    model,
+    num_orders,
+    horizon,
+    x,
+    y,
+    l,
+    available_lines,
+    line_available=None,
+    target_order_indices=None,
+    name_prefix="order_line_extra_drift",
+):
+    """
+    添加通用订单跨日产线额外漂移惩罚。
+
+    适用：
+    1. 普通排产；
+    2. 停电排产；
+    3. 插单排产。
+
+    规则：
+    订单只要在相邻有效生产日都生产，
+    就尽量沿用原产线号。
+
+    允许：
+    1. 正常加线；
+    2. 正常减线；
+    3. 必要换线。
+
+    惩罚：
+    扣除正常加减线之后的额外产线漂移。
+    """
+    day_pairs = _build_adjacent_work_day_pairs(
+        horizon=horizon,
+        available_lines=available_lines,
+    )
+
+    return _add_extra_line_drift_for_day_pairs(
+        model=model,
+        num_orders=num_orders,
+        x=x,
+        y=y,
+        l=l,
+        day_pairs=day_pairs,
+        line_available=line_available,
+        target_order_indices=target_order_indices,
+        name_prefix=name_prefix,
+    )
+
+
+def add_outage_resume_line_position_constraints(
+    model,
+    num_orders,
+    horizon,
+    x,
+    y,
+    l,
+    available_lines,
+    line_available=None,
+    target_order_indices=None,
+    name_prefix="outage_resume_extra_drift",
+):
+    """
+    添加停电前后恢复原产线的专项惩罚。
+
+    只比较：
+        全厂停电前最后一个可生产日
+        和
+        全厂停电后第一个可生产日
+
+    作用：
+    如果订单跨过停电区间继续生产，
+    停电后更强烈地倾向于恢复停电前使用过的产线号。
+    """
+    outage_resume_pairs = _build_outage_resume_day_pairs(
+        horizon=horizon,
+        available_lines=available_lines,
+    )
+
+    return _add_extra_line_drift_for_day_pairs(
+        model=model,
+        num_orders=num_orders,
+        x=x,
+        y=y,
+        l=l,
+        day_pairs=outage_resume_pairs,
+        line_available=line_available,
+        target_order_indices=target_order_indices,
+        name_prefix=name_prefix,
+    )
 
 
 def add_order_start_end_linking_constraints(

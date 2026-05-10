@@ -142,16 +142,56 @@ def run_normal_schedule(base_raw_orders):
     solved_model_horizon = None
     solved_display_dates = None
     solved_extend_months = None
+    solved_attempt_type = None
 
-    for extend_months in range(MAX_AUTO_EXTEND_MONTHS_FOR_OUTAGE + 1):
-        if extend_months == 0:
-            forced_model_end_date = None
-            print("\n=== 普通停电求解尝试：不扩展月份，优先尝试在当前月份内完成 ===")
-        else:
-            forced_model_end_date = add_months_to_month_end(
+    # =========================
+    # 普通停电模式下的分阶段求解尝试
+    # =========================
+    #
+    # 业务逻辑：
+    # 1. 先尝试在原交期内完成；
+    # 2. 如果原交期内无解，再尝试在当前月份月末前完成；
+    # 3. 如果当前月份内仍无解，再继续自动扩展到后续月份；
+    # 4. 这样可以避免原交期无解后，直接从 5 月 8 日跳到 6 月 30 日。
+    outage_attempts = [
+        {
+            "attempt_type": "original_due",
+            "forced_model_end_date": None,
+            "extend_months": 0,
+        },
+        {
+            "attempt_type": "current_month",
+            "forced_model_end_date": add_months_to_month_end(
+                natural_model_end_date,
+                0,
+            ),
+            "extend_months": 0,
+        },
+    ]
+
+    for extend_months in range(1, MAX_AUTO_EXTEND_MONTHS_FOR_OUTAGE + 1):
+        outage_attempts.append({
+            "attempt_type": "extended_month",
+            "forced_model_end_date": add_months_to_month_end(
                 natural_model_end_date,
                 extend_months,
+            ),
+            "extend_months": extend_months,
+        })
+
+    for attempt in outage_attempts:
+        attempt_type = attempt["attempt_type"]
+        forced_model_end_date = attempt["forced_model_end_date"]
+        extend_months = attempt["extend_months"]
+
+        if attempt_type == "original_due":
+            print("\n=== 普通停电求解尝试：优先尝试在原交期内完成 ===")
+        elif attempt_type == "current_month":
+            print(
+                f"\n=== 普通停电求解尝试：原交期内无解，"
+                f"继续尝试在当前月份月末 {forced_model_end_date} 前完成 ==="
             )
+        else:
             print(
                 f"\n=== 普通停电求解尝试：自动扩展 {extend_months} 个月，"
                 f"模型结束日期扩展至 {forced_model_end_date} ==="
@@ -189,15 +229,23 @@ def run_normal_schedule(base_raw_orders):
             solved_model_horizon = model_horizon
             solved_display_dates = display_dates
             solved_extend_months = extend_months
+            solved_attempt_type = attempt_type
 
-            if extend_months == 0:
-                print("\n普通停电排产在当前月份内找到可行解。")
+            if attempt_type == "original_due":
+                print("\n普通停电排产在原交期内找到可行解。")
+            elif attempt_type == "current_month":
+                print("\n普通停电排产通过当前月份内软交期找到可行解。")
             else:
                 print(f"\n普通停电排产通过自动扩展 {extend_months} 个月找到可行解。")
 
             break
 
-        print("注意：当前停电扩展周期下仍无可行解，系统将尝试扩展到后续月份。")
+        if attempt_type == "original_due":
+            print("注意：原交期内无可行解，系统将继续尝试在当前月份月末前完成。")
+        elif attempt_type == "current_month":
+            print("注意：当前月份内仍无可行解，系统将尝试扩展到后续月份。")
+        else:
+            print("注意：当前停电扩展周期下仍无可行解，系统将尝试继续扩展到后续月份。")
 
     if solved_result is None:
         print("\n所有普通停电自动扩展尝试均未找到可行解。")

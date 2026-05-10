@@ -5,6 +5,7 @@ from scheduler_model.model_helpers import (
     add_basic_linking_constraints,
     add_one_block_on_order_day_constraints,
     add_active_line_block_constraints,
+    add_available_active_line_block_constraints,
     add_order_window_constraints,
     add_order_start_end_linking_constraints,
     add_capacity_constraints,
@@ -87,7 +88,8 @@ def build_model(
     5. 订单允许被全厂停电日打断，但忽略全厂停电日后仍需连续；
     6. 同一产线同一订单允许被该产线停电日打断，但忽略该线停电日后仍最多一个连续段；
     7. 不再要求所有开线产线整体连续，因为停电可能把可用产线切成多段；
-    8. 停电模式下额外加入订单产线位置稳定性软约束，尽量减少同一订单跨生产日频繁换线。
+    8. 加入订单产线位置稳定性软约束，尽量减少同一订单跨生产日无意义漂移；
+    9. 跨全厂停电区间时，额外加强停电后恢复原产线的倾向。
 
     插单模式：
     1. 读取旧排产结果中的“表2_产线日历”作为 previous_plan；
@@ -95,8 +97,8 @@ def build_model(
     3. 插单日期之后允许重排；
     4. 对原订单偏离旧计划的部分加入扰动惩罚，尽量减少对原计划的影响；
     5. 最晚完工日期改为软交期，超过原交期仍可继续生产，但产生延期惩罚；
-    6. 对延期订单数量和紧迫度加权延期天数加入惩罚，尽量减少延期订单和延期天数；
-    7. 对加量订单加入原产线延续惩罚，尽量让原本生产该订单的产线继续生产；
+    6. 对延期订单数量和紧迫度加权延期天数加入惩罚；
+    7. 对加量订单加入原产线延续惩罚；
     8. 插单模式下允许原订单被打断后续产，但会对额外生产段加入惩罚；
     9. 插单模式下将满线生产、产线稳定、集中生产作为软约束引导，而不是硬约束。
 
@@ -203,12 +205,6 @@ def build_model(
     # E. 添加基础约束
     # =========================
 
-    # 包含：
-    # 1. 产线独占约束；
-    # 2. u[i,t] 与 x[i,j,t] 衔接；
-    # 3. 停电产线不可生产；
-    # 4. l[j,t] 与 x[i,j,t] 衔接；
-    # 5. y[j,t] 与 l[j,t] 衔接。
     add_basic_linking_constraints(
         model=model,
         num_orders=num_orders,
@@ -245,6 +241,16 @@ def build_model(
             active_block_start=active_block_start,
             active_block_end=active_block_end,
         )
+    else:
+        add_available_active_line_block_constraints(
+            model=model,
+            horizon=horizon,
+            u=u,
+            prod_day=prod_day,
+            active_block_start=active_block_start,
+            active_block_end=active_block_end,
+            line_available=line_available,
+        )
 
     # =========================
     # F. 添加订单时间窗口约束
@@ -253,7 +259,6 @@ def build_model(
         # 软交期模式：
         # 保留“最早开工前不能生产”，
         # 但不再把最晚完工作为禁止生产的硬边界。
-        # 超过原最晚完工后仍可生产，但会在延期约束中产生延期惩罚。
         _add_release_only_window_constraints(
             model=model,
             orders=model_orders,
@@ -276,12 +281,6 @@ def build_model(
     # =========================
     # G. 添加连续性约束
     # =========================
-
-    # 包含：
-    # 1. 订单整体连续生产约束；
-    # 2. 产线连续开线约束；
-    # 3. 同一产线同一订单最多一个连续生产段；
-    # 4. 插单模式下原订单分段续产的软惩罚。
     (
         order_segment_start,
         order_total_segments,
@@ -343,11 +342,14 @@ def build_model(
     # =========================
 
     # 包含：
-    # 1. 停电模式下订单产线位置稳定性；
-    # 2. 插单模式下插单订单 / 加量订单产线位置稳定性。
+    # 1. 通用订单产线号稳定性；
+    # 2. 停电模式下停电前后恢复原产线加强；
+    # 3. 插单模式下插单订单 / 加量订单额外产线稳定性。
     (
         order_line_position_change,
         total_order_line_position_change,
+        outage_resume_line_position_change,
+        total_outage_resume_line_position_change,
         insert_line_stability_change,
         total_insert_line_stability,
     ) = add_position_stability_constraints(
@@ -484,6 +486,7 @@ def build_model(
         over_output=over_output,
         over_output_units=over_output_units,
         total_order_line_position_change=total_order_line_position_change,
+        total_outage_resume_line_position_change=total_outage_resume_line_position_change,
         weighted_plan_change_penalty=weighted_plan_change_penalty,
         total_quantity_continue_break=total_quantity_continue_break,
         total_delayed_orders=total_delayed_orders,
@@ -543,8 +546,16 @@ def build_model(
         "available_lines": available_lines,
         "full_outage_days": full_outage_days,
         "has_power_outage": has_power_outage,
+
+        # 产线位置稳定性变量
         "order_line_position_change": order_line_position_change,
         "total_order_line_position_change": total_order_line_position_change,
+        "outage_resume_line_position_change": outage_resume_line_position_change,
+        "total_outage_resume_line_position_change": total_outage_resume_line_position_change,
+        "insert_line_stability_change": insert_line_stability_change,
+        "total_insert_line_stability": total_insert_line_stability,
+
+        # 目标函数统计变量
         "total_changeovers": total_changeovers,
         "total_active_days": total_active_days,
         "total_order_span": total_order_span,
@@ -593,10 +604,6 @@ def build_model(
         "idle_lines": idle_lines,
         "total_idle_lines": total_idle_lines,
         "total_insert_prod_days": total_insert_prod_days,
-
-        # 插单模式：插单订单 / 加量订单产线位置稳定性变量
-        "insert_line_stability_change": insert_line_stability_change,
-        "total_insert_line_stability": total_insert_line_stability,
     }
 
     return model, variables
