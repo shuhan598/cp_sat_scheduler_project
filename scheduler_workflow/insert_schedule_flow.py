@@ -168,16 +168,63 @@ def run_insert_schedule(base_raw_orders, inserted_raw_orders):
     solved_insert_info = None
     solved_freeze_until_day = None
     solved_extend_months = None
+    solved_attempt_type = None
+
+    # =========================
+    # 插单模式：分阶段求解尝试
+    # =========================
+    #
+    # 业务逻辑：
+    # 1. 先尝试在原交期 / 原自然周期内完成；
+    # 2. 如果原交期内无解，再尝试在当前月份月末前完成；
+    # 3. 如果当前月份内仍无解，再继续扩展到后续月份；
+    #
+    # 这样可以避免从 2026-05-06 直接跳到 2026-06-30。
+    insert_attempts = [
+        {
+            "attempt_type": "original_due",
+            "forced_model_end_date": None,
+            "extend_months": 0,
+        }
+    ]
+
+    current_month_end_date = add_months_to_month_end(
+        natural_period_end_date,
+        0,
+    )
+
+    insert_attempts.append({
+        "attempt_type": "current_month",
+        "forced_model_end_date": current_month_end_date,
+        "extend_months": 0,
+    })
 
     for extend_months in attempts:
-        if extend_months == 0:
-            forced_model_end_date = None
-            print("\n=== 插单求解尝试：不扩展月份，优先尝试在当前月份内完成 ===")
-        else:
-            forced_model_end_date = add_months_to_month_end(
+        if extend_months <= 0:
+            continue
+
+        insert_attempts.append({
+            "attempt_type": "extended_month",
+            "forced_model_end_date": add_months_to_month_end(
                 natural_period_end_date,
                 extend_months,
+            ),
+            "extend_months": extend_months,
+        })
+
+    for attempt in insert_attempts:
+        attempt_type = attempt["attempt_type"]
+        forced_model_end_date = attempt["forced_model_end_date"]
+        extend_months = attempt["extend_months"]
+
+        if attempt_type == "original_due":
+            print("\n=== 插单求解尝试：优先尝试在原交期内完成 ===")
+        elif attempt_type == "current_month":
+            print(
+                f"\n=== 插单求解尝试：原交期内无解，"
+                f"继续尝试在当前月份月末 {forced_model_end_date} 前完成 ==="
             )
+        else:
             print(
                 f"\n=== 插单求解尝试：自动扩展 {extend_months} 个月，"
                 f"模型结束日期扩展至 {forced_model_end_date} ==="
@@ -241,7 +288,15 @@ def run_insert_schedule(base_raw_orders, inserted_raw_orders):
             solved_insert_info = insert_info
             solved_freeze_until_day = freeze_until_day
             solved_extend_months = extend_months
+            solved_attempt_type = attempt_type
             break
+
+        if attempt_type == "original_due":
+            print("注意：原交期内无可行解，系统将继续尝试在当前月份月末前完成。")
+        elif attempt_type == "current_month":
+            print("注意：当前月份内仍无可行解，系统将尝试扩展到后续月份。")
+        else:
+            print("注意：当前插单扩展周期下仍无可行解，系统将尝试继续扩展到后续月份。")
 
     if solved_result is None:
         print("\n所有自动扩展尝试均未找到可行解。")
@@ -270,10 +325,17 @@ def run_insert_schedule(base_raw_orders, inserted_raw_orders):
 
     print(f"\n插单排产结果已导出到 Excel：{output_file}")
     print("Sheet 1：表1_订单视图")
-    print_monthly_sheet_info(solved_display_dates)
+    print_monthly_sheet_info(
+        solved_display_dates,
+        calendar_df=solved_result["calendar_df"],
+        detail_df=solved_result["detail_df"],
+    )
 
-    if solved_extend_months == 0:
-        print("\n本次插单重排未跨月扩展。")
+    if solved_attempt_type == "original_due":
+        print("\n本次插单重排在原交期内完成，未启用月末扩展。")
+    elif solved_attempt_type == "current_month":
+        print("\n本次插单重排通过当前月份内软交期找到可行解，未跨到下个月。")
+        print(f"当前月份内模型结束日期: {solved_model_end_date}")
     else:
         print(f"\n本次插单重排自动扩展了 {solved_extend_months} 个月。")
         print(f"扩展后模型结束日期: {solved_model_end_date}")
@@ -299,6 +361,7 @@ def run_insert_schedule(base_raw_orders, inserted_raw_orders):
         "insert_info": solved_insert_info,
         "freeze_until_day": solved_freeze_until_day,
         "extend_months": solved_extend_months,
+        "attempt_type": solved_attempt_type,
         "previous_plan_file": previous_plan_file,
         "previous_plan": previous_plan,
         "previous_order_finish_day": previous_order_finish_day,

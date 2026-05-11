@@ -48,17 +48,6 @@ def export_insert_to_excel(
 ):
     """
     插单模式导出。
-
-    原逻辑：
-    Sheet1：表1_订单视图
-        插单后的订单视图，包含原订单和插单订单。
-
-    Sheet2：表2_产线日历
-        原始排产计划，从旧排产结果文件中复制。
-
-    Sheet3：表3_插单后产线日历
-        插单后的新排产计划，格式与表2一致。
-
     新逻辑：
     Sheet1：表1_订单视图
         插单后的订单视图，包含：
@@ -216,6 +205,112 @@ def _get_month_from_date_column(column_name):
     return int(month_text)
 
 
+def _is_empty_cell_value(value):
+    """
+    判断单元格值是否为空。
+
+    兼容：
+    - None
+    - 空字符串
+    - pandas NaN
+    """
+
+    if value is None:
+        return True
+
+    try:
+        import pandas as pd
+        if pd.isna(value):
+            return True
+    except Exception:
+        pass
+
+    return str(value).strip() == ""
+
+
+def _is_real_schedule_value(value):
+    """
+    判断产线日历单元格是否是真实排产。
+
+    以下内容不算真实排产：
+    - 空值
+    - 停电检修
+
+    只有真实订单名才算实际排产。
+    """
+
+    if _is_empty_cell_value(value):
+        return False
+
+    text = str(value).strip()
+
+    if text == "停电检修":
+        return False
+
+    return True
+
+
+def _has_actual_schedule_in_month(calendar_month_df, detail_month_df):
+    """
+    判断某个月是否存在实际排产。
+
+    优先根据上方产线日历判断：
+    - 只要日期列中出现真实订单名，就认为该月份需要导出。
+
+    如果产线日历没有识别到，再用下方订单日产量明细兜底判断。
+    """
+
+    # =========================
+    # 1. 根据上方产线日历判断
+    # =========================
+    for col in calendar_month_df.columns:
+        if col == "产线":
+            continue
+
+        if not _is_date_column(col):
+            continue
+
+        for value in calendar_month_df[col]:
+            if _is_real_schedule_value(value):
+                return True
+
+    # =========================
+    # 2. 兜底：根据下方订单日产量明细判断
+    # =========================
+    for _, row in detail_month_df.iterrows():
+        order_name = row.get("订单", "")
+
+        if _is_empty_cell_value(order_name):
+            continue
+
+        order_name = str(order_name).strip()
+
+        if order_name in ["线体合计", "产能合计"]:
+            continue
+
+        for col in detail_month_df.columns:
+            if col == "订单":
+                continue
+
+            if not _is_date_column(col):
+                continue
+
+            value = row[col]
+
+            if _is_empty_cell_value(value):
+                continue
+
+            try:
+                if float(value) <= 0:
+                    continue
+            except Exception:
+                pass
+
+            return True
+
+    return False
+
+
 def _split_calendar_and_detail_by_month(calendar_df, detail_df):
     """
     按月份拆分产线日历和订单日产量明细。
@@ -285,6 +380,24 @@ def _split_calendar_and_detail_by_month(calendar_df, detail_df):
 
         detail_month_df = detail_df[["订单"] + detail_cols].copy()
 
+        # =========================
+        # 跳过没有实际排产的月份
+        # =========================
+        #
+        # 例如：
+        # 模型为了寻找可行解扩展到了 6 月 30 日，
+        # 但实际订单全部在 5 月完成。
+        #
+        # 此时 calendar_df 中虽然存在 6/1 ~ 6/30 的日期列，
+        # 但这些列没有任何真实订单。
+        #
+        # 这种月份不应该导出为单独的“6月排产图”。
+        if not _has_actual_schedule_in_month(
+                calendar_month_df=calendar_month_df,
+                detail_month_df=detail_month_df,
+        ):
+            continue
+
         sheet_name = f"{month}{MONTHLY_SCHEDULE_SHEET_SUFFIX}"
 
         month_items.append({
@@ -293,6 +406,9 @@ def _split_calendar_and_detail_by_month(calendar_df, detail_df):
             "calendar_df": calendar_month_df,
             "detail_df": detail_month_df,
         })
+
+    if not month_items:
+        raise ValueError("排产结果中没有识别到任何存在实际生产的月份，无法生成月份排产图。")
 
     return month_items
 
@@ -711,22 +827,37 @@ def _format_calendar_and_detail_sheet(
     for row_idx in range(1, ws.max_row + 1):
         ws.row_dimensions[row_idx].height = 22
 
-def print_monthly_sheet_info(display_dates):
-    """
-    根据展示日期打印本次会导出的月份排产图名称。
 
-    例如：
-    display_dates 覆盖 2026-05-01 ~ 2026-06-30，
-    则控制台打印：
-        Sheet 2：5月排产图
-        Sheet 3：6月排产图
+def print_monthly_sheet_info(display_dates, calendar_df=None, detail_df=None):
     """
+    打印本次实际会导出的月份排产图名称。
+
+    如果传入 calendar_df / detail_df：
+    - 按实际有排产的月份打印；
+    - 空月份不会打印。
+
+    如果没有传入 calendar_df / detail_df：
+    - 保持旧逻辑，按 display_dates 打印。
+    """
+
     months = []
 
-    for display_date in display_dates:
-        month = display_date.month
-        if month not in months:
-            months.append(month)
+    if calendar_df is not None and detail_df is not None:
+        month_sheets = _split_calendar_and_detail_by_month(
+            calendar_df=calendar_df,
+            detail_df=detail_df,
+        )
+
+        months = [
+            item["month"]
+            for item in month_sheets
+        ]
+
+    else:
+        for display_date in display_dates:
+            month = display_date.month
+            if month not in months:
+                months.append(month)
 
     for idx, month in enumerate(months, start=2):
         print(f"Sheet {idx}：{month}月排产图")
