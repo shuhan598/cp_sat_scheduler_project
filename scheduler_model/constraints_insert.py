@@ -15,8 +15,22 @@
 from config import (
     NUM_LINES,
     QUANTITY_INCREASE_LOOKBACK_DAYS,
+
+    # 原有插单扰动权重
     WEIGHT_PLAN_CHANGE,
     WEIGHT_QUANTITY_INCREASE_CHANGE,
+
+    # 新增：插单局部插入与原订单顺延权重
+    WEIGHT_INSERT_USE_EMPTY_BEFORE_DUE,
+    WEIGHT_INSERT_OCCUPY_OLD_BEFORE_DUE,
+    WEIGHT_INSERT_USE_EMPTY_AFTER_DUE,
+    WEIGHT_INSERT_OCCUPY_OLD_AFTER_DUE,
+    WEIGHT_OCCUPIED_ORDER_URGENCY,
+    WEIGHT_ORIGINAL_USE_EMPTY_FOR_MAKEUP,
+    WEIGHT_ORIGINAL_MAKEUP_SAME_LINE,
+    WEIGHT_ORIGINAL_MAKEUP_DIFF_LINE,
+    WEIGHT_ORIGINAL_TO_OTHER_ORIGINAL_CHANGE,
+    WEIGHT_ORIGINAL_TO_EMPTY_CHANGE,
 )
 
 from scheduler_model.model_helpers import (
@@ -163,6 +177,96 @@ def _build_quantity_continue_lines(
             continue_lines_by_order[old_name].add(line_idx)
 
     return continue_lines_by_order
+
+
+def _build_old_lines_by_order(
+    previous_plan,
+    old_order_names,
+    horizon,
+):
+    """
+    统计旧计划中每个原订单曾经使用过哪些产线。
+
+    用途：
+    插单后，如果原订单被挤占，需要后续补产，
+    则优先鼓励它继续使用自己旧计划中用过的产线。
+    """
+
+    old_order_names = set(old_order_names or [])
+
+    old_lines_by_order = {
+        order_name: set()
+        for order_name in old_order_names
+    }
+
+    if not previous_plan:
+        return old_lines_by_order
+
+    for (line_idx, day_idx), old_name in previous_plan.items():
+        if day_idx < 0 or day_idx >= horizon:
+            continue
+
+        if _is_non_order_label(old_name):
+            continue
+
+        if old_name in old_lines_by_order:
+            old_lines_by_order[old_name].add(line_idx)
+
+    return old_lines_by_order
+
+
+def _is_old_line_for_order(
+    order_name,
+    line_idx,
+    old_lines_by_order,
+):
+    """
+    判断某条产线是否是订单在旧计划中使用过的产线。
+    """
+
+    return line_idx in old_lines_by_order.get(order_name, set())
+
+
+def _is_quantity_increase_preferred_line(
+    line_idx,
+    order_name,
+    quantity_continue_lines_by_order,
+):
+    """
+    判断某条产线是否是加量订单的优先延续产线。
+
+    加量订单在原产线上继续生产，属于合理扰动，
+    应该使用较低惩罚。
+    """
+
+    return line_idx in quantity_continue_lines_by_order.get(order_name, set())
+
+
+def _get_order_urgency_weight_by_name(orders):
+    """
+    获取订单紧迫度权重。
+
+    用途：
+    插单挤占原订单时，如果被挤占订单本身很紧急，
+    则额外提高挤占惩罚，避免急单挤急单。
+    """
+
+    return {
+        order["name"]: int(order.get("urgency_weight", 0))
+        for order in orders
+    }
+
+
+def _get_original_due(order):
+    """
+    获取订单原始交期。
+
+    插单模式下，模型内部 due 可能被扩展为 horizon - 1。
+    但这里传入的是原始 orders，一般仍然保留原 due。
+    为了兼容，优先取 _original_due。
+    """
+
+    return int(order.get("_original_due", order["due"]))
 
 
 def _is_low_penalty_quantity_increase_cell(
@@ -484,35 +588,16 @@ def add_insert_plan_change_constraints(
     enable_insert_mode,
 ):
     """
-    插单模式：冻结旧计划 + 原计划扰动惩罚。
+    插单模式：冻结旧计划 + 分级扰动惩罚。
 
-    业务含义：
-    1. 插单日期之前的旧计划作为硬约束冻结，不允许改变；
-    2. 插单日期之后允许重排；
-    3. 对原订单偏离旧计划的部分加入扰动惩罚，尽量减少对原计划的影响；
-    4. 对加量订单加入原产线延续惩罚，尽量让原本生产该订单的产线继续生产。
-
-    返回：
-        plan_change:
-            原计划扰动变量。
-
-        total_plan_change:
-            原计划扰动总次数。
-
-        weighted_plan_change_penalty:
-            按权重计算后的扰动惩罚项。
-
-        quantity_continue_break:
-            加量订单未延续原产线的惩罚变量。
-
-        total_quantity_continue_break:
-            加量订单未延续原产线的总次数。
-
-        quantity_continue_lines_by_order:
-            加量订单对应的优先延续产线集合。
-
-        freeze_until_day:
-            处理后的冻结截止模型日。
+    新版业务逻辑：
+    1. 插单日前旧计划硬冻结；
+    2. 插单日后允许重排；
+    3. 插单优先在自身交期内使用旧计划空闲位置；
+    4. 交期内空闲不足时，允许插单挤占原订单；
+    5. 插单挤占原订单时，优先挤占紧迫度低的订单；
+    6. 被挤占原订单后续补产时，尽量使用自己旧计划用过的产线；
+    7. 原订单之间互相替换、无关订单大面积重排，给予较高惩罚。
     """
 
     plan_change = {}
@@ -538,6 +623,9 @@ def add_insert_plan_change_constraints(
 
         freeze_until_day = min(int(freeze_until_day), horizon - 1)
 
+        # =========================
+        # 1. 识别加量订单优先延续产线
+        # =========================
         quantity_continue_lines_by_order = _build_quantity_continue_lines(
             previous_plan=previous_plan,
             quantity_increased_order_names=quantity_increased_order_names,
@@ -545,8 +633,22 @@ def add_insert_plan_change_constraints(
             horizon=horizon,
         )
 
-        # 检查旧计划中是否存在当前订单列表无法识别的订单名称。
-        # 如果旧计划订单名称和输入订单名称不一致，冻结约束可能错误。
+        # =========================
+        # 2. 识别原订单旧计划使用过的产线
+        # =========================
+        old_lines_by_order = _build_old_lines_by_order(
+            previous_plan=previous_plan,
+            old_order_names=old_order_names,
+            horizon=horizon,
+        )
+
+        order_urgency_weight_by_name = _get_order_urgency_weight_by_name(
+            orders
+        )
+
+        # =========================
+        # 3. 检查旧计划中是否存在当前订单列表无法识别的订单名称
+        # =========================
         unknown_old_names = set()
 
         for (i, t), old_name in previous_plan.items():
@@ -564,13 +666,9 @@ def add_insert_plan_change_constraints(
                 f"{unknown_text}。请检查 input_orders.xlsx 和旧排产结果是否对应。"
             )
 
-        # 1）硬冻结：冻结期内每条产线每天必须保持旧计划
-        #
-        # previous_plan[(i, t)] = old_name
-        #
-        # 如果旧计划中第 i 条线第 t 天生产 old_name，
-        # 则新模型中该位置必须继续生产 old_name。
-        # 如果旧计划中为空，则该位置必须保持为空。
+        # =========================
+        # 4. 硬冻结：冻结期内每条产线每天必须保持旧计划
+        # =========================
         if freeze_until_day >= 0:
             for i in range(NUM_LINES):
                 for t in range(0, freeze_until_day + 1):
@@ -586,62 +684,213 @@ def add_insert_plan_change_constraints(
                             x[i, j, t] == (1 if old_j == j else 0)
                         )
 
-        # 2）软扰动：冻结期之后允许重排，但尽量少改原订单计划
+        # =========================
+        # 5. 软扰动：冻结期之后按业务类型分级惩罚
+        # =========================
         #
-        # 只对原订单计算扰动，不对插单订单计算扰动。
-        # 例如：
-        # 原计划 Line1 / 5月12日 / 公版 = 1
-        # 新计划不再是公版，则记一次扰动。
+        # 分类逻辑：
         #
-        # 原计划 Line1 / 5月12日 / 嘉泰盛 = 0
-        # 新计划变成嘉泰盛，也记一次扰动。
+        # A. 旧计划为空：
+        #    1）插单在交期内使用空位：低惩罚或 0；
+        #    2）插单在交期后使用空位：高惩罚；
+        #    3）原订单移动到空位补产：按是否原产线分级惩罚。
+        #
+        # B. 旧计划中有原订单 old_name：
+        #    1）新计划仍为 old_name：不惩罚；
+        #    2）新计划变成插单：允许，但按插单交期和 old_name 紧迫度惩罚；
+        #    3）新计划变成其他原订单：重罚，避免全局重排；
+        #    4）新计划变成空：重罚。
         change_start_day = max(0, freeze_until_day + 1)
 
         weighted_plan_change_terms = []
 
         for i in range(NUM_LINES):
-            for j, order in enumerate(orders):
-                order_name = order["name"]
+            for t in range(change_start_day, horizon):
+                old_name = previous_plan.get((i, t), "")
+                old_has_order = not _is_non_order_label(old_name)
 
-                if order_name not in old_order_names:
-                    continue
+                assigned_sum = sum(
+                    x[i, j, t]
+                    for j in range(num_orders)
+                )
 
-                for t in range(change_start_day, horizon):
-                    old_name = previous_plan.get((i, t), "")
-                    old_value = 1 if old_name == order_name else 0
+                if old_has_order:
+                    old_j = order_name_to_idx.get(old_name)
 
-                    change = model.NewBoolVar(
-                        f"plan_change_line{i}_order{j}_day{t}"
+                    # 正常情况下 old_j 一定存在，因为前面已经检查过 unknown_old_names。
+                    if old_j is None:
+                        continue
+
+                    # 5.1 旧计划原订单单元格是否发生变化。
+                    #
+                    # old_cell_changed = 1 表示：
+                    # 旧计划中该位置原本生产 old_name，
+                    # 但新计划中不再生产 old_name。
+                    old_cell_changed = model.NewBoolVar(
+                        f"old_cell_changed_line{i}_oldorder{old_j}_day{t}"
                     )
 
-                    plan_change[i, j, t] = change
+                    model.Add(
+                        old_cell_changed == 1 - x[i, old_j, t]
+                    )
 
-                    if old_value == 1:
-                        # 原来这里生产该订单，现在不生产，算一次改动
-                        model.Add(change >= 1 - x[i, j, t])
-                    else:
-                        # 原来这里不生产该订单，现在生产该订单，也算一次改动
-                        model.Add(change >= x[i, j, t])
+                    plan_change[i, old_j, t] = old_cell_changed
 
-                    if _is_low_penalty_quantity_increase_cell(
-                        line_idx=i,
-                        old_order_name=old_name,
-                        quantity_continue_lines_by_order=quantity_continue_lines_by_order,
-                    ):
-                        weight = WEIGHT_QUANTITY_INCREASE_CHANGE
-                    else:
-                        weight = WEIGHT_PLAN_CHANGE
+                    # 5.2 旧计划原订单变成空白。
+                    #
+                    # 这说明原计划被打掉了，但没有被插单或其他订单使用，
+                    # 一般属于不理想扰动。
+                    empty_after_change = model.NewBoolVar(
+                        f"old_cell_to_empty_line{i}_day{t}"
+                    )
+
+                    model.Add(assigned_sum == 0).OnlyEnforceIf(
+                        empty_after_change
+                    )
+                    model.Add(assigned_sum >= 1).OnlyEnforceIf(
+                        empty_after_change.Not()
+                    )
 
                     weighted_plan_change_terms.append(
-                        weight * change
+                        WEIGHT_ORIGINAL_TO_EMPTY_CHANGE * empty_after_change
                     )
+
+                    # 5.3 旧计划原订单被插单订单挤占。
+                    #
+                    # 插单在自身交期内挤占：可以接受，中等惩罚；
+                    # 插单超过交期后挤占：较高惩罚；
+                    # 如果被挤占的 old_name 很紧急，再额外加惩罚。
+                    occupied_order_urgency = order_urgency_weight_by_name.get(
+                        old_name,
+                        0,
+                    )
+
+                    for j, order in enumerate(orders):
+                        new_order_name = order["name"]
+
+                        if new_order_name == old_name:
+                            continue
+
+                        if new_order_name in inserted_order_names:
+                            original_due = _get_original_due(order)
+
+                            if t <= original_due:
+                                base_weight = WEIGHT_INSERT_OCCUPY_OLD_BEFORE_DUE
+                            else:
+                                base_weight = WEIGHT_INSERT_OCCUPY_OLD_AFTER_DUE
+
+                            weight = (
+                                base_weight
+                                + WEIGHT_OCCUPIED_ORDER_URGENCY * occupied_order_urgency
+                            )
+
+                            weighted_plan_change_terms.append(
+                                weight * x[i, j, t]
+                            )
+
+                            continue
+
+                        if new_order_name in old_order_names:
+                            # 旧计划原订单被其他原订单替换。
+                            #
+                            # 这通常意味着全局重排，应该重罚。
+                            # 但如果新订单是加量订单，且该产线是它的优先延续产线，
+                            # 则认为是合理加量扰动，使用低惩罚。
+                            if (
+                                new_order_name in quantity_increased_order_names
+                                and _is_quantity_increase_preferred_line(
+                                    line_idx=i,
+                                    order_name=new_order_name,
+                                    quantity_continue_lines_by_order=quantity_continue_lines_by_order,
+                                )
+                            ):
+                                weight = WEIGHT_QUANTITY_INCREASE_CHANGE
+                            else:
+                                weight = WEIGHT_ORIGINAL_TO_OTHER_ORIGINAL_CHANGE
+
+                            weighted_plan_change_terms.append(
+                                weight * x[i, j, t]
+                            )
+
+                            continue
+
+                        # 兜底：理论上不会进入这里。
+                        weighted_plan_change_terms.append(
+                            WEIGHT_PLAN_CHANGE * x[i, j, t]
+                        )
+
+                else:
+                    # =========================
+                    # 旧计划为空：插单或原订单使用空闲产能
+                    # =========================
+                    for j, order in enumerate(orders):
+                        new_order_name = order["name"]
+
+                        if new_order_name in inserted_order_names:
+                            # 插单使用旧计划空闲位置。
+                            #
+                            # 如果在交期内使用空位，这是最理想的情况；
+                            # 如果超过交期后才用空位，则说明插单延期，惩罚较高。
+                            original_due = _get_original_due(order)
+
+                            if t <= original_due:
+                                weight = WEIGHT_INSERT_USE_EMPTY_BEFORE_DUE
+                            else:
+                                weight = WEIGHT_INSERT_USE_EMPTY_AFTER_DUE
+
+                            if weight > 0:
+                                weighted_plan_change_terms.append(
+                                    weight * x[i, j, t]
+                                )
+
+                            # 插单使用空位不计入“原计划扰动单元格数”，
+                            # 因为没有挤占旧计划原订单。
+                            continue
+
+                        if new_order_name in old_order_names:
+                            # 原订单移动到旧计划空闲位置补产。
+                            #
+                            # 如果是加量订单，且使用优先延续产线，低惩罚；
+                            # 否则判断是否使用自己旧计划中用过的产线。
+                            if (
+                                new_order_name in quantity_increased_order_names
+                                and _is_quantity_increase_preferred_line(
+                                    line_idx=i,
+                                    order_name=new_order_name,
+                                    quantity_continue_lines_by_order=quantity_continue_lines_by_order,
+                                )
+                            ):
+                                weight = WEIGHT_QUANTITY_INCREASE_CHANGE
+                            elif _is_old_line_for_order(
+                                order_name=new_order_name,
+                                line_idx=i,
+                                old_lines_by_order=old_lines_by_order,
+                            ):
+                                weight = min(
+                                    WEIGHT_ORIGINAL_USE_EMPTY_FOR_MAKEUP,
+                                    WEIGHT_ORIGINAL_MAKEUP_SAME_LINE,
+                                )
+                            else:
+                                weight = WEIGHT_ORIGINAL_MAKEUP_DIFF_LINE
+
+                            weighted_plan_change_terms.append(
+                                weight * x[i, j, t]
+                            )
+
+                            # 原订单移动到旧空位，计入扰动统计。
+                            plan_change[i, j, t] = x[i, j, t]
 
         if plan_change:
             total_plan_change = sum(plan_change.values())
+
+        if weighted_plan_change_terms:
             weighted_plan_change_penalty = sum(weighted_plan_change_terms)
 
-        # 3）加量订单延续原产线：
+        # =========================
+        # 6. 加量订单延续原产线
+        # =========================
         #
+        # 保留你原来的逻辑：
         # 如果订单 A 加量，且 Line 1 是 A 的优先延续产线，
         # 那么当 A 在某天生产时，模型倾向让 Line 1 继续生产 A。
         for inc_order_name, line_set in quantity_continue_lines_by_order.items():

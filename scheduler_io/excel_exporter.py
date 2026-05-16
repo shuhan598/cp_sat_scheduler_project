@@ -1,4 +1,5 @@
 from config import (
+    NUM_LINES,
     OUTPUT_EXCEL_FILE,
     INSERT_OUTPUT_EXCEL_FILE,
     MONTHLY_SCHEDULE_SHEET_SUFFIX,
@@ -71,11 +72,16 @@ def export_insert_to_excel(
     if output_file is None:
         output_file = INSERT_OUTPUT_EXCEL_FILE
 
+    order_color_mapping = _load_order_color_mapping_from_previous_plan(
+        previous_plan_file
+    )
+
     return export_monthly_schedule_to_excel(
         order_df=order_df,
         calendar_df=new_calendar_df,
         detail_df=new_detail_df,
         output_file=output_file,
+        order_color_mapping=order_color_mapping,
     )
 
 
@@ -84,6 +90,7 @@ def export_monthly_schedule_to_excel(
     calendar_df,
     detail_df,
     output_file,
+    order_color_mapping=None,
 ):
     """
     按月份导出排产结果。
@@ -167,6 +174,7 @@ def export_monthly_schedule_to_excel(
                 detail_title_excel_row=detail_title_excel_row,
                 title_text=sheet_name,
                 detail_title_text=f"{sheet_name}-订单日产量明细",
+                order_color_mapping=order_color_mapping,
             )
 
     return output_file
@@ -248,6 +256,125 @@ def _is_real_schedule_value(value):
         return False
 
     return True
+
+
+def _is_monthly_schedule_sheet_name(sheet_name):
+    """
+    判断 sheet 是否是“月份排产图”。
+    """
+    import re
+
+    text = str(sheet_name).strip()
+    pattern = rf"^\d+{re.escape(MONTHLY_SCHEDULE_SHEET_SUFFIX)}$"
+
+    return re.match(pattern, text) is not None
+
+
+def _get_cell_fill_color(cell):
+    """
+    从旧排产结果单元格中读取订单填充色。
+
+    只读取当前导出逻辑生成的 RGB 填充色；读取失败时返回 None。
+    """
+    fill = cell.fill
+
+    if fill is None or fill.fill_type is None:
+        return None
+
+    color = fill.fgColor
+
+    if color is None:
+        return None
+
+    if color.type != "rgb" or not color.rgb:
+        return None
+
+    rgb = str(color.rgb).strip()
+
+    if len(rgb) == 8:
+        rgb = rgb[-6:]
+
+    if len(rgb) != 6:
+        return None
+
+    return rgb.upper()
+
+
+def _load_order_color_mapping_from_previous_plan(previous_plan_file):
+    """
+    从旧排产结果文件中读取已有订单颜色映射。
+
+    读取失败或没有识别到颜色时返回 None，调用方会自动回退到原颜色分配方式。
+    """
+    if not previous_plan_file:
+        return None
+
+    try:
+        import os
+        from openpyxl import load_workbook
+
+        if not os.path.exists(previous_plan_file):
+            return None
+
+        workbook = load_workbook(previous_plan_file, data_only=True)
+        order_color_mapping = {}
+
+        for sheet_name in workbook.sheetnames:
+            if not _is_monthly_schedule_sheet_name(sheet_name):
+                continue
+
+            ws = workbook[sheet_name]
+
+            for row in ws.iter_rows(
+                min_row=3,
+                max_row=2 + NUM_LINES,
+                min_col=2,
+                max_col=ws.max_column,
+            ):
+                for cell in row:
+                    value = cell.value
+
+                    if not _is_real_schedule_value(value):
+                        continue
+
+                    order_name = str(value).strip()
+
+                    if order_name in order_color_mapping:
+                        continue
+
+                    fill_color = _get_cell_fill_color(cell)
+
+                    if fill_color:
+                        order_color_mapping[order_name] = fill_color
+
+        return order_color_mapping or None
+
+    except Exception:
+        return None
+
+
+def _get_order_color_pool():
+    """
+    返回订单颜色池。
+    """
+    return [
+        "E2F0D9",
+        "D9EAF7",
+        "FCE4D6",
+        "EAD1DC",
+        "FFF2CC",
+        "D9EAD3",
+        "D0E0E3",
+        "EDEDED",
+        "F4CCCC",
+        "D9D2E9",
+        "CFE2F3",
+        "F9CB9C",
+        "D5E8D4",
+        "F8CECC",
+        "DAE8FC",
+        "E1D5E7",
+    ]
 
 
 def _has_actual_schedule_in_month(calendar_month_df, detail_month_df):
@@ -666,6 +793,7 @@ def _format_calendar_and_detail_sheet(
     detail_title_excel_row,
     title_text="表2：产线日历",
     detail_title_text="表2-附表：订单日产量明细",
+    order_color_mapping=None,
 ):
     from openpyxl.styles import PatternFill, Font
     from openpyxl.utils import get_column_letter
@@ -721,27 +849,15 @@ def _format_calendar_and_detail_sheet(
     # =========================
     # 订单颜色池：上下两个表保持一致
     # =========================
-    color_pool = [
-        "E2F0D9",
-        "D9EAF7",
-        "FCE4D6",
-        "EAD1DC",
-        "FFF2CC",
-        "D9EAD3",
-        "D0E0E3",
-        "EDEDED",
-        "F4CCCC",
-        "D9D2E9",
-        "CFE2F3",
-        "F9CB9C",
-        "D5E8D4",
-        "F8CECC",
-        "DAE8FC",
-        "E1D5E7",
-    ]
+    color_pool = _get_order_color_pool()
 
-    order_fills = {}
+    if order_color_mapping is None:
+        order_fills = {}
+    else:
+        order_fills = order_color_mapping
+
     color_idx = 0
+    used_colors = set(order_fills.values())
 
     # 从上方产线日历里按订单第一次出现顺序分配颜色
     for r in range(calendar_first_data_row, calendar_last_data_row + 1):
@@ -750,7 +866,14 @@ def _format_calendar_and_detail_sheet(
             if value is not None:
                 value = str(value).strip()
                 if value != "" and value not in order_fills:
+                    while (
+                        len(used_colors) < len(color_pool)
+                        and color_pool[color_idx % len(color_pool)] in used_colors
+                    ):
+                        color_idx += 1
+
                     order_fills[value] = color_pool[color_idx % len(color_pool)]
+                    used_colors.add(order_fills[value])
                     color_idx += 1
 
     # =========================
