@@ -1,33 +1,28 @@
 from config import (
-    NUM_LINES,
     OUTPUT_EXCEL_FILE,
     INSERT_OUTPUT_EXCEL_FILE,
     MONTHLY_SCHEDULE_SHEET_SUFFIX,
     ORDER_VIEW_SHEET_NAME,
+    MACHINE_ALLOCATION_SHEET_NAME,
+    DATE_MACHINE_SUMMARY_SHEET_NAME,
 )
 
 
-def export_to_excel(order_df, calendar_df, detail_df, output_file=None):
+def export_to_excel(
+    order_df,
+    calendar_df,
+    detail_df,
+    machine_df=None,
+    date_machine_df=None,
+    output_file=None,
+):
     """
     普通排产导出。
 
-    原逻辑：
-    Sheet1：表1_订单视图
-    Sheet2：表2_产线日历
-
-    新逻辑：
     Sheet1：表1_订单视图
     Sheet2及以后：按月份自动生成排产图
-
-    示例：
-    如果订单输入是 5 月：
-        Sheet1：表1_订单视图
-        Sheet2：5月排产图
-
-    如果排产周期跨到 6 月：
-        Sheet1：表1_订单视图
-        Sheet2：5月排产图
-        Sheet3：6月排产图
+    倒数第二个 Sheet：表3_工序机台数明细 (按订单, 如果 machine_df 非空)
+    最后一个 Sheet：表4_按日期机台数汇总 (按日期 + M/A 对比, 如果 date_machine_df 非空)
     """
     if output_file is None:
         output_file = OUTPUT_EXCEL_FILE
@@ -36,6 +31,8 @@ def export_to_excel(order_df, calendar_df, detail_df, output_file=None):
         order_df=order_df,
         calendar_df=calendar_df,
         detail_df=detail_df,
+        machine_df=machine_df,
+        date_machine_df=date_machine_df,
         output_file=output_file,
     )
 
@@ -44,44 +41,33 @@ def export_insert_to_excel(
     order_df,
     new_calendar_df,
     new_detail_df,
+    machine_df=None,
+    date_machine_df=None,
     previous_plan_file=None,
     output_file=None,
 ):
     """
     插单模式导出。
-    新逻辑：
-    Sheet1：表1_订单视图
-        插单后的订单视图，包含：
-        - 原订单；
-        - 加量订单；
-        - 新插单订单；
-        - 同名新批次订单；
-        - 是否延期、延期天数、自动紧迫度等字段。
 
+    Sheet1：表1_订单视图
     Sheet2及以后：按月份自动生成插单后的新排产图
-        例如：
-        - 5月排产图
-        - 6月排产图
-        - 7月排产图
+    倒数第二个 Sheet：表3_工序机台数明细 (按订单)
+    最后一个 Sheet：表4_按日期机台数汇总 (按日期 + M/A 对比)
 
     说明：
-    previous_plan_file 参数保留，是为了兼容 main.py 中原来的调用方式。
-    新版导出不再把旧计划复制到插单结果文件中，
-    而是直接按月份输出插单后的完整新计划。
+    previous_plan_file 参数保留, 是为了兼容旧 main.py 中原来的调用方式。
+    新版导出不再把旧计划复制到插单结果文件中。
     """
     if output_file is None:
         output_file = INSERT_OUTPUT_EXCEL_FILE
-
-    order_color_mapping = _load_order_color_mapping_from_previous_plan(
-        previous_plan_file
-    )
 
     return export_monthly_schedule_to_excel(
         order_df=order_df,
         calendar_df=new_calendar_df,
         detail_df=new_detail_df,
+        machine_df=machine_df,
+        date_machine_df=date_machine_df,
         output_file=output_file,
-        order_color_mapping=order_color_mapping,
     )
 
 
@@ -90,34 +76,11 @@ def export_monthly_schedule_to_excel(
     calendar_df,
     detail_df,
     output_file,
-    order_color_mapping=None,
+    machine_df=None,
+    date_machine_df=None,
 ):
     """
     按月份导出排产结果。
-
-    Sheet1：
-        表1_订单视图
-
-    Sheet2及以后：
-        根据 calendar_df / detail_df 中的日期列自动拆分月份。
-
-    示例：
-        calendar_df 列为：
-            产线, 5/1, 5/2, ..., 5/31
-
-        则输出：
-            5月排产图
-
-        calendar_df 列为：
-            产线, 5/1, ..., 5/31, 6/1, ..., 6/30
-
-        则输出：
-            5月排产图
-            6月排产图
-
-    每个月 sheet 内部仍保持原来的结构：
-        上方：产线日历
-        下方：订单日产量明细
     """
     month_sheets = _split_calendar_and_detail_by_month(
         calendar_df=calendar_df,
@@ -174,7 +137,40 @@ def export_monthly_schedule_to_excel(
                 detail_title_excel_row=detail_title_excel_row,
                 title_text=sheet_name,
                 detail_title_text=f"{sheet_name}-订单日产量明细",
-                order_color_mapping=order_color_mapping,
+            )
+
+        # =========================
+        # 表3_工序机台数明细 (按订单)
+        # =========================
+        if machine_df is not None and len(machine_df) > 0:
+            machine_df.to_excel(
+                writer,
+                sheet_name=MACHINE_ALLOCATION_SHEET_NAME,
+                index=False,
+                startrow=1,
+            )
+
+            ws_machine = workbook[MACHINE_ALLOCATION_SHEET_NAME]
+            _format_machine_allocation_sheet(
+                ws_machine,
+                machine_df=machine_df,
+            )
+
+        # =========================
+        # 表4_按日期机台数汇总 (按日期 + M/A 对比)
+        # =========================
+        if date_machine_df is not None and len(date_machine_df) > 0:
+            date_machine_df.to_excel(
+                writer,
+                sheet_name=DATE_MACHINE_SUMMARY_SHEET_NAME,
+                index=False,
+                startrow=1,
+            )
+
+            ws_date_machine = workbook[DATE_MACHINE_SUMMARY_SHEET_NAME]
+            _format_date_machine_summary_sheet(
+                ws_date_machine,
+                date_machine_df=date_machine_df,
             )
 
     return output_file
@@ -211,231 +207,6 @@ def _get_month_from_date_column(column_name):
     text = str(column_name).strip()
     month_text = text.split("/", 1)[0]
     return int(month_text)
-
-
-def _is_empty_cell_value(value):
-    """
-    判断单元格值是否为空。
-
-    兼容：
-    - None
-    - 空字符串
-    - pandas NaN
-    """
-
-    if value is None:
-        return True
-
-    try:
-        import pandas as pd
-        if pd.isna(value):
-            return True
-    except Exception:
-        pass
-
-    return str(value).strip() == ""
-
-
-def _is_real_schedule_value(value):
-    """
-    判断产线日历单元格是否是真实排产。
-
-    以下内容不算真实排产：
-    - 空值
-    - 停电检修
-
-    只有真实订单名才算实际排产。
-    """
-
-    if _is_empty_cell_value(value):
-        return False
-
-    text = str(value).strip()
-
-    if text == "停电检修":
-        return False
-
-    return True
-
-
-def _is_monthly_schedule_sheet_name(sheet_name):
-    """
-    判断 sheet 是否是“月份排产图”。
-    """
-    import re
-
-    text = str(sheet_name).strip()
-    pattern = rf"^\d+{re.escape(MONTHLY_SCHEDULE_SHEET_SUFFIX)}$"
-
-    return re.match(pattern, text) is not None
-
-
-def _get_cell_fill_color(cell):
-    """
-    从旧排产结果单元格中读取订单填充色。
-
-    只读取当前导出逻辑生成的 RGB 填充色；读取失败时返回 None。
-    """
-    fill = cell.fill
-
-    if fill is None or fill.fill_type is None:
-        return None
-
-    color = fill.fgColor
-
-    if color is None:
-        return None
-
-    if color.type != "rgb" or not color.rgb:
-        return None
-
-    rgb = str(color.rgb).strip()
-
-    if len(rgb) == 8:
-        rgb = rgb[-6:]
-
-    if len(rgb) != 6:
-        return None
-
-    return rgb.upper()
-
-
-def _load_order_color_mapping_from_previous_plan(previous_plan_file):
-    """
-    从旧排产结果文件中读取已有订单颜色映射。
-
-    读取失败或没有识别到颜色时返回 None，调用方会自动回退到原颜色分配方式。
-    """
-    if not previous_plan_file:
-        return None
-
-    try:
-        import os
-        from openpyxl import load_workbook
-
-        if not os.path.exists(previous_plan_file):
-            return None
-
-        workbook = load_workbook(previous_plan_file, data_only=True)
-        order_color_mapping = {}
-
-        for sheet_name in workbook.sheetnames:
-            if not _is_monthly_schedule_sheet_name(sheet_name):
-                continue
-
-            ws = workbook[sheet_name]
-
-            for row in ws.iter_rows(
-                min_row=3,
-                max_row=2 + NUM_LINES,
-                min_col=2,
-                max_col=ws.max_column,
-            ):
-                for cell in row:
-                    value = cell.value
-
-                    if not _is_real_schedule_value(value):
-                        continue
-
-                    order_name = str(value).strip()
-
-                    if order_name in order_color_mapping:
-                        continue
-
-                    fill_color = _get_cell_fill_color(cell)
-
-                    if fill_color:
-                        order_color_mapping[order_name] = fill_color
-
-        return order_color_mapping or None
-
-    except Exception:
-        return None
-
-
-def _get_order_color_pool():
-    """
-    返回订单颜色池。
-    """
-    return [
-        "E2F0D9",
-        "D9EAF7",
-        "FCE4D6",
-        "EAD1DC",
-        "FFF2CC",
-        "D9EAD3",
-        "D0E0E3",
-        "EDEDED",
-        "F4CCCC",
-        "D9D2E9",
-        "CFE2F3",
-        "F9CB9C",
-        "D5E8D4",
-        "F8CECC",
-        "DAE8FC",
-        "E1D5E7",
-    ]
-
-
-def _has_actual_schedule_in_month(calendar_month_df, detail_month_df):
-    """
-    判断某个月是否存在实际排产。
-
-    优先根据上方产线日历判断：
-    - 只要日期列中出现真实订单名，就认为该月份需要导出。
-
-    如果产线日历没有识别到，再用下方订单日产量明细兜底判断。
-    """
-
-    # =========================
-    # 1. 根据上方产线日历判断
-    # =========================
-    for col in calendar_month_df.columns:
-        if col == "产线":
-            continue
-
-        if not _is_date_column(col):
-            continue
-
-        for value in calendar_month_df[col]:
-            if _is_real_schedule_value(value):
-                return True
-
-    # =========================
-    # 2. 兜底：根据下方订单日产量明细判断
-    # =========================
-    for _, row in detail_month_df.iterrows():
-        order_name = row.get("订单", "")
-
-        if _is_empty_cell_value(order_name):
-            continue
-
-        order_name = str(order_name).strip()
-
-        if order_name in ["线体合计", "产能合计"]:
-            continue
-
-        for col in detail_month_df.columns:
-            if col == "订单":
-                continue
-
-            if not _is_date_column(col):
-                continue
-
-            value = row[col]
-
-            if _is_empty_cell_value(value):
-                continue
-
-            try:
-                if float(value) <= 0:
-                    continue
-            except Exception:
-                pass
-
-            return True
-
-    return False
 
 
 def _split_calendar_and_detail_by_month(calendar_df, detail_df):
@@ -507,24 +278,6 @@ def _split_calendar_and_detail_by_month(calendar_df, detail_df):
 
         detail_month_df = detail_df[["订单"] + detail_cols].copy()
 
-        # =========================
-        # 跳过没有实际排产的月份
-        # =========================
-        #
-        # 例如：
-        # 模型为了寻找可行解扩展到了 6 月 30 日，
-        # 但实际订单全部在 5 月完成。
-        #
-        # 此时 calendar_df 中虽然存在 6/1 ~ 6/30 的日期列，
-        # 但这些列没有任何真实订单。
-        #
-        # 这种月份不应该导出为单独的“6月排产图”。
-        if not _has_actual_schedule_in_month(
-                calendar_month_df=calendar_month_df,
-                detail_month_df=detail_month_df,
-        ):
-            continue
-
         sheet_name = f"{month}{MONTHLY_SCHEDULE_SHEET_SUFFIX}"
 
         month_items.append({
@@ -533,9 +286,6 @@ def _split_calendar_and_detail_by_month(calendar_df, detail_df):
             "calendar_df": calendar_month_df,
             "detail_df": detail_month_df,
         })
-
-    if not month_items:
-        raise ValueError("排产结果中没有识别到任何存在实际生产的月份，无法生成月份排产图。")
 
     return month_items
 
@@ -793,7 +543,6 @@ def _format_calendar_and_detail_sheet(
     detail_title_excel_row,
     title_text="表2：产线日历",
     detail_title_text="表2-附表：订单日产量明细",
-    order_color_mapping=None,
 ):
     from openpyxl.styles import PatternFill, Font
     from openpyxl.utils import get_column_letter
@@ -849,15 +598,27 @@ def _format_calendar_and_detail_sheet(
     # =========================
     # 订单颜色池：上下两个表保持一致
     # =========================
-    color_pool = _get_order_color_pool()
+    color_pool = [
+        "E2F0D9",
+        "D9EAF7",
+        "FCE4D6",
+        "EAD1DC",
+        "FFF2CC",
+        "D9EAD3",
+        "D0E0E3",
+        "EDEDED",
+        "F4CCCC",
+        "D9D2E9",
+        "CFE2F3",
+        "F9CB9C",
+        "D5E8D4",
+        "F8CECC",
+        "DAE8FC",
+        "E1D5E7",
+    ]
 
-    if order_color_mapping is None:
-        order_fills = {}
-    else:
-        order_fills = order_color_mapping
-
+    order_fills = {}
     color_idx = 0
-    used_colors = set(order_fills.values())
 
     # 从上方产线日历里按订单第一次出现顺序分配颜色
     for r in range(calendar_first_data_row, calendar_last_data_row + 1):
@@ -866,14 +627,7 @@ def _format_calendar_and_detail_sheet(
             if value is not None:
                 value = str(value).strip()
                 if value != "" and value not in order_fills:
-                    while (
-                        len(used_colors) < len(color_pool)
-                        and color_pool[color_idx % len(color_pool)] in used_colors
-                    ):
-                        color_idx += 1
-
                     order_fills[value] = color_pool[color_idx % len(color_pool)]
-                    used_colors.add(order_fills[value])
                     color_idx += 1
 
     # =========================
@@ -951,36 +705,318 @@ def _format_calendar_and_detail_sheet(
         ws.row_dimensions[row_idx].height = 22
 
 
-def print_monthly_sheet_info(display_dates, calendar_df=None, detail_df=None):
+def _format_machine_allocation_sheet(ws, machine_df):
     """
-    打印本次实际会导出的月份排产图名称。
+    格式化"工序机台数明细"表。
 
-    如果传入 calendar_df / detail_df：
-    - 按实际有排产的月份打印；
-    - 空月份不会打印。
+    布局:
+        第 1 行: 表标题 (合并单元格)
+        第 2 行: 列标题 (订单 / 日期 / 占用产线数 / 工序1-制绒 / ...)
+        第 3 行起: 数据行, 同一订单使用一致的浅色背景, 便于按订单区分。
 
-    如果没有传入 calendar_df / detail_df：
-    - 保持旧逻辑，按 display_dates 打印。
+    数据来自 scheduler_results.machine_allocation.parse_machine_allocation_view,
+    每行表示一个 (订单, 日期) 的机台数分配。
     """
+    from openpyxl.styles import PatternFill, Font
+    from openpyxl.utils import get_column_letter
 
+    styles = _get_base_styles()
+
+    num_cols = machine_df.shape[1]
+    num_rows = machine_df.shape[0]
+
+    # =========================
+    # 表标题
+    # =========================
+    ws["A1"] = "表3：工序机台数明细 (基于产线数 l[j,t] 后处理计算)"
+    ws["A1"].font = styles["title_font"]
+    ws["A1"].fill = styles["title_fill"]
+    ws.merge_cells(
+        start_row=1,
+        start_column=1,
+        end_row=1,
+        end_column=num_cols,
+    )
+
+    header_row = 2
+    first_data_row = 3
+    last_data_row = first_data_row + num_rows - 1
+
+    _format_header_row(ws, header_row, num_cols)
+    _format_range(ws, first_data_row, last_data_row, 1, num_cols)
+
+    # =========================
+    # 按订单分配颜色, 便于阅读
+    # =========================
+    color_pool = [
+        "E2F0D9",
+        "D9EAF7",
+        "FCE4D6",
+        "EAD1DC",
+        "FFF2CC",
+        "D9EAD3",
+        "D0E0E3",
+        "EDEDED",
+        "F4CCCC",
+        "D9D2E9",
+        "CFE2F3",
+        "F9CB9C",
+        "D5E8D4",
+        "F8CECC",
+        "DAE8FC",
+        "E1D5E7",
+    ]
+
+    order_fills = {}
+    color_idx = 0
+
+    for r in range(first_data_row, last_data_row + 1):
+        order_value = ws.cell(r, 1).value
+        if order_value is None:
+            continue
+
+        order_name = str(order_value).strip()
+        if order_name == "":
+            continue
+
+        if order_name not in order_fills:
+            order_fills[order_name] = color_pool[color_idx % len(color_pool)]
+            color_idx += 1
+
+    for r in range(first_data_row, last_data_row + 1):
+        order_value = ws.cell(r, 1).value
+        if order_value is None:
+            continue
+
+        order_name = str(order_value).strip()
+        if order_name == "" or order_name not in order_fills:
+            continue
+
+        fill = PatternFill("solid", fgColor=order_fills[order_name])
+        ws.cell(r, 1).font = Font(bold=True)
+        ws.cell(r, 1).fill = fill
+
+    # =========================
+    # 列宽
+    # =========================
+    column_widths = {
+        "订单": 18,
+        "日期": 10,
+        "占用产线数": 12,
+    }
+
+    for col_idx in range(1, num_cols + 1):
+        header_value = ws.cell(row=header_row, column=col_idx).value
+        header_text = str(header_value).strip() if header_value is not None else ""
+        col_letter = get_column_letter(col_idx)
+        ws.column_dimensions[col_letter].width = column_widths.get(header_text, 14)
+
+    # =========================
+    # 数字格式
+    # =========================
+    # zgy: 占用产线数 (col 3) 保持整数;
+    #      工序机台数列 (col 4+) 按值类型自适应:
+    #        - 整数值 (机台数够): "0"
+    #        - 浮点值 (机台数不够, 突破 MATRIX_A 上限): "0.00"
+    for r in range(first_data_row, last_data_row + 1):
+        ws.cell(r, 3).number_format = "0"
+        for col_idx in range(4, num_cols + 1):
+            cell = ws.cell(r, col_idx)
+            val = cell.value
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                if float(val).is_integer():
+                    cell.number_format = "0"
+                else:
+                    cell.number_format = "0.00"
+
+    # =========================
+    # 冻结窗格和筛选
+    # =========================
+    ws.freeze_panes = "D3"
+    ws.auto_filter.ref = f"A{header_row}:{get_column_letter(num_cols)}{last_data_row}"
+
+
+def _format_date_machine_summary_sheet(ws, date_machine_df):
+    """
+    格式化"按日期机台数汇总"表 (表4)。
+
+    布局:
+        第 1 行: 表标题 (合并单元格)
+        第 2 行: 列标题 (日期 / 类型/订单 / 占用产线 / 工序1~工序12 / 备注)
+        第 3 行起: 数据行, 每个日期一个分块, 包含:
+            - 当天每个订单一行 (浅色背景);
+            - M矩阵汇总 (深蓝色背景, 加粗);
+            - A矩阵理论 (浅黄背景);
+            - 差异(M-A) (按正/负配色: 正=红=机台不够, 负=绿=空余);
+            - 空行分隔。
+    """
+    from openpyxl.styles import PatternFill, Font
+    from openpyxl.utils import get_column_letter
+
+    styles = _get_base_styles()
+
+    num_cols = date_machine_df.shape[1]
+    num_rows = date_machine_df.shape[0]
+
+    # 表标题
+    ws["A1"] = "表4：按日期机台数汇总 (M矩阵 vs A矩阵理论 对比, 用于切线决策)"
+    ws["A1"].font = styles["title_font"]
+    ws["A1"].fill = styles["title_fill"]
+    ws.merge_cells(
+        start_row=1,
+        start_column=1,
+        end_row=1,
+        end_column=num_cols,
+    )
+
+    header_row = 2
+    first_data_row = 3
+    last_data_row = first_data_row + num_rows - 1
+
+    _format_header_row(ws, header_row, num_cols)
+    _format_range(ws, first_data_row, last_data_row, 1, num_cols)
+
+    # =========================
+    # 颜色定义
+    # =========================
+    m_sum_fill = PatternFill("solid", fgColor="2F75B5")        # 深蓝
+    m_sum_font = Font(bold=True, color="FFFFFF")               # 白字
+    a_ref_fill = PatternFill("solid", fgColor="FFE699")        # 浅黄
+    a_ref_font = Font(italic=True)
+    diff_pos_fill = PatternFill("solid", fgColor="F8CBAD")     # 红 (机台不够)
+    diff_neg_fill = PatternFill("solid", fgColor="C6E0B4")     # 绿 (空余)
+    diff_zero_fill = PatternFill("solid", fgColor="D9D9D9")    # 灰 (平衡)
+    diff_font_bold = Font(bold=True)
+
+    order_color_pool = [
+        "E2F0D9", "FCE4D6", "EAD1DC", "FFF2CC",
+        "D9EAD3", "D0E0E3", "F4CCCC", "D9D2E9",
+        "CFE2F3", "F9CB9C", "D5E8D4", "F8CECC",
+        "DAE8FC", "E1D5E7",
+    ]
+
+    order_fills = {}
+    color_idx = 0
+
+    # 找到"类型/订单"列 (一般在第 2 列, 但稳妥起见按表头定位)
+    type_col_idx = None
+    for c in range(1, num_cols + 1):
+        header_val = ws.cell(row=header_row, column=c).value
+        if header_val is not None and str(header_val).strip() == "类型/订单":
+            type_col_idx = c
+            break
+    if type_col_idx is None:
+        type_col_idx = 2
+
+    # 工序列范围: 跳过 日期 / 类型/订单 / 占用产线, 不包括最后的 备注 列
+    process_col_start = 4
+    process_col_end = num_cols - 1   # 备注是最后一列
+
+    # =========================
+    # 逐行配色
+    # =========================
+    for r in range(first_data_row, last_data_row + 1):
+        type_value = ws.cell(r, type_col_idx).value
+        if type_value is None:
+            continue
+
+        type_text = str(type_value).strip()
+
+        if type_text == "":
+            continue
+
+        if type_text == "M矩阵汇总":
+            for c in range(1, num_cols + 1):
+                cell = ws.cell(r, c)
+                cell.fill = m_sum_fill
+                cell.font = m_sum_font
+            continue
+
+        if type_text.startswith("A矩阵理论"):
+            for c in range(1, num_cols + 1):
+                cell = ws.cell(r, c)
+                cell.fill = a_ref_fill
+                cell.font = a_ref_font
+            continue
+
+        if type_text == "差异(M-A)":
+            # 工序列按数值正/负着色
+            for c in range(1, num_cols + 1):
+                cell = ws.cell(r, c)
+                cell.font = diff_font_bold
+
+            for c in range(process_col_start, process_col_end + 1):
+                cell = ws.cell(r, c)
+                val = cell.value
+                if isinstance(val, (int, float)):
+                    if val > 0:
+                        cell.fill = diff_pos_fill
+                    elif val < 0:
+                        cell.fill = diff_neg_fill
+                    else:
+                        cell.fill = diff_zero_fill
+            continue
+
+        # 否则视为订单行: 按订单名分配颜色
+        if type_text not in order_fills:
+            order_fills[type_text] = order_color_pool[color_idx % len(order_color_pool)]
+            color_idx += 1
+
+        fill = PatternFill("solid", fgColor=order_fills[type_text])
+        # 订单/类型列加粗
+        ws.cell(r, type_col_idx).font = Font(bold=True)
+        ws.cell(r, type_col_idx).fill = fill
+
+    # =========================
+    # 列宽
+    # =========================
+    column_widths = {
+        "日期": 8,
+        "类型/订单": 22,
+        "占用产线": 10,
+        "备注": 50,
+    }
+
+    for col_idx in range(1, num_cols + 1):
+        header_value = ws.cell(row=header_row, column=col_idx).value
+        header_text = str(header_value).strip() if header_value is not None else ""
+        col_letter = get_column_letter(col_idx)
+        ws.column_dimensions[col_letter].width = column_widths.get(header_text, 12)
+
+    # 工序列数字格式
+    # zgy: 按单元格值类型自适应:
+    #   - 整数值 (机台数够 / A 矩阵理论): "0"
+    #   - 浮点值 (机台数不够 / 差异有小数): "0.00"
+    for col_idx in range(process_col_start, process_col_end + 1):
+        for r in range(first_data_row, last_data_row + 1):
+            cell = ws.cell(r, col_idx)
+            val = cell.value
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
+                if float(val).is_integer():
+                    cell.number_format = "0"
+                else:
+                    cell.number_format = "0.00"
+
+    # 冻结窗格 + 筛选
+    ws.freeze_panes = "D3"
+
+
+def print_monthly_sheet_info(display_dates):
+    """
+    根据展示日期打印本次会导出的月份排产图名称。
+
+    例如：
+    display_dates 覆盖 2026-05-01 ~ 2026-06-30，
+    则控制台打印：
+        Sheet 2：5月排产图
+        Sheet 3：6月排产图
+    """
     months = []
 
-    if calendar_df is not None and detail_df is not None:
-        month_sheets = _split_calendar_and_detail_by_month(
-            calendar_df=calendar_df,
-            detail_df=detail_df,
-        )
-
-        months = [
-            item["month"]
-            for item in month_sheets
-        ]
-
-    else:
-        for display_date in display_dates:
-            month = display_date.month
-            if month not in months:
-                months.append(month)
+    for display_date in display_dates:
+        month = display_date.month
+        if month not in months:
+            months.append(month)
 
     for idx, month in enumerate(months, start=2):
         print(f"Sheet {idx}：{month}月排产图")

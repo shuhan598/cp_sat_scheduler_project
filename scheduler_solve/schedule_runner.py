@@ -170,7 +170,7 @@ def run_single_schedule_attempt(
     print("\n找到可行解！")
     print_solution_summary(solver, variables)
 
-    order_df, calendar_df, detail_df = parse_all_results(
+    order_df, calendar_df, detail_df, machine_df, date_machine_df = parse_all_results(
         solver,
         orders,
         variables,
@@ -187,6 +187,8 @@ def run_single_schedule_attempt(
         "order_df": order_df,
         "calendar_df": calendar_df,
         "detail_df": detail_df,
+        "machine_df": machine_df,
+        "date_machine_df": date_machine_df,
         "line_capacity": line_capacity,
         "line_available": line_available,
         "available_lines": available_lines,

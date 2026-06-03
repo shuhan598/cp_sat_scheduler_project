@@ -97,15 +97,13 @@ def run_normal_schedule(base_raw_orders):
             result["order_df"],
             result["calendar_df"],
             result["detail_df"],
+            machine_df=result.get("machine_df"),
+            date_machine_df=result.get("date_machine_df"),
         )
 
         print(f"\n排产结果已全部导出到 Excel：{output_file}")
         print("Sheet 1：表1_订单视图")
-        print_monthly_sheet_info(
-            display_dates,
-            calendar_df=result["calendar_df"],
-            detail_df=result["detail_df"],
-        )
+        print_monthly_sheet_info(display_dates)
 
         return {
             "output_file": output_file,
@@ -267,15 +265,13 @@ def run_normal_schedule(base_raw_orders):
         solved_result["order_df"],
         solved_result["calendar_df"],
         solved_result["detail_df"],
+        machine_df=solved_result.get("machine_df"),
+        date_machine_df=solved_result.get("date_machine_df"),
     )
 
     print(f"\n排产结果已全部导出到 Excel：{output_file}")
     print("Sheet 1：表1_订单视图")
-    print_monthly_sheet_info(
-        solved_display_dates,
-        calendar_df=solved_result["calendar_df"],
-        detail_df=solved_result["detail_df"],
-    )
+    print_monthly_sheet_info(solved_display_dates)
 
     return {
         "output_file": output_file,

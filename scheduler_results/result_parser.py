@@ -4,6 +4,11 @@ import pandas as pd
 
 from config import NUM_LINES, DAILY_CAPACITY
 
+from scheduler_results.machine_allocation import (
+    parse_machine_allocation_view,
+    parse_date_machine_summary_view,
+)
+
 
 def day_to_date(day_idx, start_date):
     """
@@ -558,6 +563,30 @@ def parse_all_results(
         has_power_outage=has_power_outage
     )
 
-    return order_df, calendar_df, detail_df
+    # 新增: 工序机台数明细表
+    # 根据 l[j, t] 后处理计算每个订单每天每个工序的机台数,
+    # 与停电、插单逻辑无关, 仅依赖订单当天占用的产线数。
+    machine_df = parse_machine_allocation_view(
+        solver,
+        orders,
+        variables,
+        model_start_date,
+        model_horizon,
+        display_dates,
+    )
+
+    # 新增: 按日期机台数汇总表 (表4)
+    # 按日期分块, 每块包含: 当天每个订单一行 + M矩阵汇总 + A矩阵理论 + 差异(M-A).
+    # 用于现场切线决策: 看当天总开线、空余机台、机台不够的工序。
+    date_machine_df = parse_date_machine_summary_view(
+        solver,
+        orders,
+        variables,
+        model_start_date,
+        model_horizon,
+        display_dates,
+    )
+
+    return order_df, calendar_df, detail_df, machine_df, date_machine_df
 
 
