@@ -9,6 +9,8 @@
 # 4. 保留普通排产和插单排产的兼容入口函数。
 # =========================
 
+import json
+
 import pandas as pd
 
 from preprocessing.date_utils import (
@@ -171,6 +173,185 @@ def _read_raw_orders_from_sheet(
 
     return raw_orders
 
+
+
+def _require_json_object(value, label):
+    if not isinstance(value, dict):
+        raise ValueError(f"JSON {label} 必须是对象。")
+
+
+def _require_json_array(value, label):
+    if not isinstance(value, list):
+        raise ValueError(f"JSON {label} 必须是数组。")
+
+
+def _parse_json_date(value, field_name, order_name, record_label):
+    if value is None or str(value).strip() == "":
+        raise ValueError(f"JSON {record_label} 订单 {order_name} 的 {field_name} 为空。")
+
+    try:
+        return pd.to_datetime(value).date()
+    except Exception:
+        raise ValueError(
+            f"JSON {record_label} 订单 {order_name} 的 {field_name}={value} "
+            f"无法识别为日期，请使用 YYYY-MM-DD 格式。"
+        )
+
+
+def _read_raw_orders_from_json_records(records, record_label, is_inserted=False):
+    required_fields = ["order", "quantity", "earliest_start", "latest_finish"]
+
+    if is_inserted:
+        required_fields = [
+            "order",
+            "quantity",
+            "insert_date",
+            "earliest_start",
+            "latest_finish",
+        ]
+
+    raw_orders = []
+
+    for row_idx, record in enumerate(records, start=1):
+        _require_json_object(record, f"{record_label}[{row_idx}]")
+
+        missing_fields = [field for field in required_fields if field not in record]
+
+        if missing_fields:
+            raise ValueError(
+                f"JSON {record_label}[{row_idx}] 缺少必要字段：{missing_fields}。"
+            )
+
+        name = str(record["order"]).strip()
+
+        if not name or name.lower() == "nan":
+            continue
+
+        quantity = record["quantity"]
+
+        if quantity is None or str(quantity).strip() == "":
+            raise ValueError(
+                f"JSON {record_label}[{row_idx}] 订单 {name} 的 quantity 为空。"
+            )
+
+        try:
+            quantity = int(quantity)
+        except Exception:
+            raise ValueError(
+                f"JSON {record_label}[{row_idx}] 订单 {name} 的 quantity 无法转换为整数。"
+            )
+
+        earliest_start = _parse_json_date(
+            record["earliest_start"],
+            "earliest_start",
+            name,
+            record_label,
+        )
+
+        latest_finish = _parse_json_date(
+            record["latest_finish"],
+            "latest_finish",
+            name,
+            record_label,
+        )
+
+        if earliest_start > latest_finish:
+            raise ValueError(
+                f"订单 {name} 的最早开工日期晚于最晚完工日期，请检查输入。"
+            )
+
+        insert_date = None
+
+        if is_inserted:
+            insert_date = _parse_json_date(
+                record["insert_date"],
+                "insert_date",
+                name,
+                record_label,
+            )
+
+            if insert_date > latest_finish:
+                raise ValueError(
+                    f"插单订单 {name} 的插单日期晚于最晚完工日期，请检查输入。"
+                )
+
+        raw_orders.append({
+            "name": name,
+            "display_name": name,
+            "original_name": name,
+            "quantity": quantity,
+            "original_quantity": quantity,
+            "increase_quantity": 0,
+            "earliest_start_date": earliest_start,
+            "latest_finish_date": latest_finish,
+            "is_inserted": is_inserted,
+            "insert_date": insert_date,
+            "insert_process_type": "插单输入" if is_inserted else "原订单",
+            "is_quantity_increased": False,
+        })
+
+    return raw_orders
+
+
+def load_raw_orders_for_insert_from_json(file_path):
+    """
+    从 JSON 文件读取原订单和插单输入。
+
+    JSON 文件结构：
+    {
+        "orders": [...],
+        "insert_orders": [...]
+    }
+
+    insert_orders 可省略或为空数组。返回结构与
+    load_raw_orders_for_insert() 保持一致。
+    """
+
+    with open(file_path, "r", encoding="utf-8") as file_obj:
+        payload = json.load(file_obj)
+
+    _require_json_object(payload, "根节点")
+
+    if "orders" not in payload:
+        raise ValueError("JSON 根节点缺少必要字段：orders。")
+
+    orders_payload = payload["orders"]
+    insert_orders_payload = payload.get("insert_orders", [])
+
+    _require_json_array(orders_payload, "orders")
+    _require_json_array(insert_orders_payload, "insert_orders")
+
+    base_raw_orders = _read_raw_orders_from_json_records(
+        records=orders_payload,
+        record_label="orders",
+        is_inserted=False,
+    )
+
+    inserted_raw_orders = _read_raw_orders_from_json_records(
+        records=insert_orders_payload,
+        record_label="insert_orders",
+        is_inserted=True,
+    )
+
+    if inserted_raw_orders:
+        print("\n检测到 JSON 插单订单：insert_orders")
+        for order in inserted_raw_orders:
+            print(order)
+    else:
+        print("\n未检测到有效插单订单，本次按普通排产运行。")
+
+    insert_dates = [
+        o["insert_date"]
+        for o in inserted_raw_orders
+        if o.get("insert_date") is not None
+    ]
+
+    insert_info = {
+        "enabled": bool(inserted_raw_orders),
+        "insert_date": min(insert_dates) if insert_dates else None,
+    }
+
+    return base_raw_orders, inserted_raw_orders, insert_info
 
 def load_raw_orders_for_insert(
     file_path,
