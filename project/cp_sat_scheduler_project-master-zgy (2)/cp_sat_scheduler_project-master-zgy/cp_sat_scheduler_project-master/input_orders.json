@@ -1,0 +1,18 @@
+{
+  "orders": [
+    {
+      "order": "意诚",
+      "quantity": 5700000,
+      "earliest_start": "2026-05-01",
+      "latest_finish": "2026-05-07"
+    },
+    {
+      "order": "至上",
+      "quantity": 12000000,
+      "earliest_start": "2026-05-01",
+      "latest_finish": "2026-05-15"
+    }
+  ],
+  "insert_orders": [],
+  "power_outages": []
+}
